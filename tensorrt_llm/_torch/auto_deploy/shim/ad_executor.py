@@ -9,6 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -45,6 +47,39 @@ from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
+
+_AD_SCHED_LOG_PATH = os.getenv("AD_SCHED_LOG_PATH", None)
+_AD_SCHED_LOG_LOCK = threading.Lock()
+_AD_SCHED_LOG_HEADER_WRITTEN = False
+
+
+def _ad_sched_log_write_csv_header() -> None:
+    """Write CSV header to the log file."""
+    global _AD_SCHED_LOG_HEADER_WRITTEN
+    if not _AD_SCHED_LOG_PATH or _AD_SCHED_LOG_HEADER_WRITTEN:
+        return
+    with _AD_SCHED_LOG_LOCK:
+        if not _AD_SCHED_LOG_HEADER_WRITTEN:
+            with open(_AD_SCHED_LOG_PATH, 'w') as f:
+                f.write("iteration,num_seqs_total,num_tokens_total,num_seqs_prefill,num_tokens_prefill,num_seqs_decode,num_tokens_decode\n")
+            _AD_SCHED_LOG_HEADER_WRITTEN = True
+
+
+def _ad_sched_log_iter_record(
+    iteration: int,
+    num_seqs_total: int,
+    num_tokens_total: int,
+    num_seqs_prefill: int,
+    num_tokens_prefill: int,
+    num_seqs_decode: int,
+    num_tokens_decode: int,
+) -> None:
+    """Write iteration record as CSV row."""
+    if not _AD_SCHED_LOG_PATH:
+        return
+    with _AD_SCHED_LOG_LOCK:
+        with open(_AD_SCHED_LOG_PATH, 'a') as f:
+            f.write(f"{iteration},{num_seqs_total},{num_tokens_total},{num_seqs_prefill},{num_tokens_prefill},{num_seqs_decode},{num_tokens_decode}\n")
 
 
 @dataclass
@@ -110,10 +145,10 @@ class ADEngine(ModelEngine):
 
         max_batch_size = ad_config.max_batch_size
         max_seq_len = ad_config.max_seq_len
+        print("GAGAM: attn_page_size from AD config: ", ad_config.attn_page_size)
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
         max_beam_width = ad_config.max_beam_width
-
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)
         if device.type == "cuda" and device.index is None:
@@ -163,13 +198,12 @@ class ADEngine(ModelEngine):
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
         self.llm_args.stream_interval = 1
         self.llm_args.attention_dp_config = None
-        self.llm_args.batch_wait_timeout_ms = 0
+        self.llm_args.batch_wait_timeout_ms = 0 #2 # GAGAM?
         self.llm_args.batch_wait_timeout_iters = 0
-        self.llm_args.batch_wait_max_tokens_ratio = 0.0
+        self.llm_args.batch_wait_max_tokens_ratio = 0 # 80.0
         self.llm_args.max_num_tokens = seq_info.max_num_tokens
         self.iter_counter = 0
         self.iter_states = {}
-
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
@@ -184,6 +218,11 @@ class ADEngine(ModelEngine):
         self.model = get_inference_model(self.cache_seq_interface)
         # start fresh with fixed seed
         torch.manual_seed(42)
+
+        # Scheduler logging state
+        self._sched_log_enabled = _AD_SCHED_LOG_PATH is not None
+        if self._sched_log_enabled:
+            _ad_sched_log_write_csv_header()
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
@@ -330,8 +369,32 @@ class ADEngine(ModelEngine):
             dim=0,
         )
 
-        return {"logits": logits_flat}
+        # Emit per-iteration scheduling log record
+        if self._sched_log_enabled:
+            num_seqs_prefill = len(scheduled_requests.context_requests)
+            num_tokens_prefill = 0
+            for req in scheduled_requests.context_requests:
+                num_tokens_prefill += getattr(req, "context_chunk_size", 0)
+            effective_gen_reqs = [
+                r
+                for r in scheduled_requests.generation_requests
+                if not getattr(r, "draft_tokens", None)
+            ]
+            num_seqs_decode = len(effective_gen_reqs)
+            num_tokens_decode = num_seqs_decode  # one token per decode req per step
+            num_seqs_total = num_seqs_prefill + num_seqs_decode
+            num_tokens_total = num_tokens_prefill + num_tokens_decode
+            _ad_sched_log_iter_record(
+                self.iter_counter,
+                num_seqs_total,
+                num_tokens_total,
+                num_seqs_prefill,
+                num_tokens_prefill,
+                num_seqs_decode,
+                num_tokens_decode,
+            )
 
+        return {"logits": logits_flat}
 
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
     """Create an AutoDeploy executor from the given configuration and tokenizer.
@@ -409,13 +472,14 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # processing the arguments here...
 
     # Chunked prefill
+    print("GAGAM: enable_chunked_prefill from AD config: ", ad_config.enable_chunked_prefill)
     if ad_config.enable_chunked_prefill:
         chunk_unit_size = ad_config.attn_page_size
         chunking_policy = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
         ctx_chunk_config: Tuple[StrEnum, int] = (chunking_policy, chunk_unit_size)
+        print("GAGAM: AD chunk prefill: chunk_unit_size:", ad_config.attn_page_size)
     else:
         ctx_chunk_config = None
-
     # scheduling
     capacitor_scheduler = BindCapacityScheduler(
         max_num_requests=ad_config.max_batch_size,
