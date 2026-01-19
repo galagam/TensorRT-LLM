@@ -10,6 +10,7 @@ from tensorrt_llm._torch.utils import ActivationType
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
@@ -112,8 +113,8 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
             # Delete the unstacked weights immediately to save GPU memory
             # This will happen automatically after the graph is canonicalized,
             # but for large models we'll run out of memory during the transformation itself.
-            gm.graph.eliminate_dead_code()
-            gm.delete_all_unused_submodules()
+            eliminate_dead_code(gm)
+            delete_all_unused_submodules(gm)
 
     return fused_key_counter
 
@@ -635,7 +636,7 @@ class MatchMoePattern(BaseTransform):
             graph.erase_node(final_hidden_state_node)
 
             while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
-                gm.graph.eliminate_dead_code()
+                eliminate_dead_code(gm)
 
             num_moe_patterns += 1
 
@@ -1272,14 +1273,14 @@ class MatchBmmMoePattern(BaseTransform):
                 graph.erase_node(output_node)
 
                 # Clean up dead nodes
-                gm.graph.eliminate_dead_code()
+                eliminate_dead_code(gm)
 
                 # Clean up dead inplace nodes in the region
                 while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
-                    gm.graph.eliminate_dead_code()
+                    eliminate_dead_code(gm)
 
                 # Delete unused submodules/parameters
-                gm.delete_all_unused_submodules()
+                delete_all_unused_submodules(gm)
 
                 num_moe_patterns += 1
 
@@ -1288,6 +1289,40 @@ class MatchBmmMoePattern(BaseTransform):
         )
         return gm, info
 
+
+def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> None:
+    """Remove original expert submodules after weights have been stacked.
+
+    This function attempts to free GPU memory by deleting the original expert
+    submodules whose weights have been replaced by fused/stacked versions.
+
+    Args:
+        gm: The GraphModule containing the expert submodules
+        weight_lists: List of weight node lists (e.g., [w1_list, w2_list, w3_list])
+    """
+    from tensorrt_llm._torch.auto_deploy.utils._graph import get_attr_by_name
+
+    # Flatten all weight lists
+    all_weights = []
+    for weight_list in weight_lists:
+        all_weights.extend(weight_list)
+
+    for w in all_weights:
+        if w.op == "get_attr" and isinstance(w.target, str):
+            w_param = get_attr_by_name(gm, w.target)
+            if w_param is not None:
+                owner_module_path, _, param_name = w.target.rpartition(".")
+                if param_name != "weight":
+                    continue
+                owner_module = gm.get_submodule(owner_module_path)
+                owner_param = get_attr_by_name(owner_module, param_name)
+                if owner_param is w_param:
+                    gm.delete_submodule(owner_module_path)
+                else:
+                    # param w is not owned by owner_module, skip
+                    continue
+            else:
+                continue
 
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
@@ -1353,8 +1388,8 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
 
         # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
         # to avoid computing them at runtime.
-        # Support per-expert input scales (broadcast if all experts have the same scale)
-        fc1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked).squeeze()
+        # If input scales are different, we use the max scale to dequant the weights
+        fc1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked.max()).squeeze()
         fc2_act_scale_recip = (1.0 / w2_input_scale_stacked).to(torch.float32)
         fc2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked).squeeze()
 
@@ -1508,12 +1543,14 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
 
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
+        gm.graph.eliminate_dead_code()
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
     # will remove the parameters/buffers that are no longer referenced
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
 
     return fused_key_counter
 
@@ -1771,8 +1808,8 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
     # will remove the parameters/buffers that are no longer referenced
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
     return fused_key_counter
 
 

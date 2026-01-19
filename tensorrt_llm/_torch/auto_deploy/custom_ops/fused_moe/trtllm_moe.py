@@ -159,10 +159,11 @@ def trtllm_quant_fp8_moe_fused(
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
     # Quantize the input
-    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale[0])
+    fc1_act_scale_max = fc1_act_scale.max()
+    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale_max)
 
     # Scales are stored in float32
-    w1_input_scale = fc1_act_scale[0]
+    w1_input_scale = fc1_act_scale_max
 
     # Prepare quant_scales for TensorRT-LLM (Cutlass) FP8 format:
     # [fc1_dequant_scale, fc2_act_scale_reciprocal, fc2_dequant_scale, gemm1_input_dequant_scale]
