@@ -1,3 +1,4 @@
+import gc
 import operator
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -12,7 +13,7 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
-from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.cuda_mem_tracker import CUDAMemFragProbe, cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_weight_name, is_linear_op, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -152,6 +153,12 @@ class QuantizationFusionMixin(ABC):
         except NotImplementedError as e:
             ad_logger.warning(f"Cannot fuse ops {keys_unfused}, skipping: {e}")
             return
+
+        # Release references to old weights/scales immediately after fusion
+        # This allows them to be garbage collected sooner
+        del params_unfused
+        del scales
+
         param_fused = nn.Parameter(weights_fused, requires_grad=False)
         setattr(gm, key_fused, param_fused)
         for name, buf in buffers_fused.items():
@@ -189,6 +196,11 @@ class QuantizationFusionMixin(ABC):
         eliminate_dead_code(gm)
         delete_all_unused_submodules(gm)
 
+        # Force garbage collection and release CUDA cached memory
+        # This reduces fragmentation by reclaiming memory before next fusion
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def _apply_fusion_pass(
         self,
         gm: GraphModule,
@@ -204,17 +216,19 @@ class QuantizationFusionMixin(ABC):
 
         idx = -1
         num_matches = 0
-        with cuda_memory_tracker():
-            for parent_node, lin_children in quant_linear_nodes.items():
-                if len(lin_children) < 2:
-                    continue
-                if not check_same_children(parent_node, partial(is_op, ops=self.target_op)):
-                    # Mixed children (e.g., quantized or non-linear) — skip fusion
-                    continue
-                self._insert_fused_quant_gemm(gm, idx := idx + 1, parent_node, lin_children)
-                num_matches += 1
+        with CUDAMemFragProbe(tag="fuse_quant_gemms", printer=self._log_info) as probe:
+            with cuda_memory_tracker():
+                for parent_node, lin_children in quant_linear_nodes.items():
+                    if len(lin_children) < 2:
+                        continue
+                    if not check_same_children(parent_node, partial(is_op, ops=self.target_op)):
+                        # Mixed children (e.g., quantized or non-linear) — skip fusion
+                        continue
+                    self._insert_fused_quant_gemm(gm, idx := idx + 1, parent_node, lin_children)
+                    num_matches += 1
 
         torch.cuda.empty_cache()
+
         return gm, TransformInfo(
             skipped=False,
             num_matches=num_matches,
@@ -281,9 +295,18 @@ class FuseFP8Gemms(QuantizationFusionMixin, BaseTransform):
         # Handle quantized weights with weight_scale.
         # First we upcast to FP32 precision and then downcast back to the original precision (FP8)
         assert weights[0].dtype == torch.float8_e4m3fn, "Only support FP8 quantized weights fusion."
-        fused_fp32_weights = torch.cat(
-            [t.to(torch.float) * s for t, s in zip(weights, weight_scale)], dim=0
+        # Pre-allocate output tensor to reduce memory allocations
+        total_rows = sum(w.shape[0] for w in weights)
+        fused_fp32_weights = torch.empty(
+            (total_rows, weights[0].shape[1]), dtype=torch.float, device=weights[0].device
         )
+        row_offset = 0
+        for w, s in zip(weights, weight_scale):
+            num_rows = w.shape[0]
+            dst = fused_fp32_weights[row_offset : row_offset + num_rows]
+            dst.copy_(w)
+            dst.mul_(s)
+            row_offset += num_rows
         new_weight_scale = torch.max(torch.stack(weight_scale))
         fused_fp8_weights = (fused_fp32_weights / new_weight_scale).to(weights[0].dtype)
 
