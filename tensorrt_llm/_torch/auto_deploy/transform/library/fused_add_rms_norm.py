@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.normalization import trtllm_fused_add_rms_norm_quant
 from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -96,28 +97,83 @@ class FuseAddRMSNorm(BaseTransform):
             add_rhs = add_node.args[1]  # e.g. attention/MoE output
             weight = norm_node.args[1]
             eps = norm_node.args[2]
+            norm_users = list(norm_node.users.keys())
+            quant_users = []
+            quant_types = []
+            for user in norm_users:
+                quant_type = self._quant_linear_type(user)
+                if quant_type is not None:
+                    quant_users.append(user)
+                    quant_types.append(quant_type)
 
-            # Insert the fused call right before the norm node. Using
-            # inserting_before(norm_node) ensures correct topological order:
-            # fused_node → norm_out → add_out all appear before norm_node.
-            with graph.inserting_before(norm_node):
-                # flashinfer_fused_add_rms_norm(x, residual, weight, eps):
-                #   residual += x        →  residual becomes add result
-                #   x = rms_norm(residual) →  x becomes norm result
-                # returns (x, residual) = (norm_result, add_result)
-                fused_node = graph.call_function(
-                    flashinfer_fused_add_rms_norm,
-                    args=(add_rhs, add_lhs, weight, eps),
-                )
-                norm_out = graph.call_function(operator.getitem, args=(fused_node, 0))
-                add_out = graph.call_function(operator.getitem, args=(fused_node, 1))
+            apply_quant_fusion = False
+            quant_type = None
+            input_scale = None
+            if len(norm_users) > 0 and len(quant_users) == len(norm_users):
+                unique_quant_types = set(quant_types)
+                if len(unique_quant_types) == 1:
+                    candidate_input_scale = self._extract_input_scale(quant_users[0])
+                    if candidate_input_scale is not None and all(
+                        self._same_scale(candidate_input_scale, self._extract_input_scale(user))
+                        for user in quant_users
+                    ):
+                        apply_quant_fusion = True
+                        quant_type = quant_types[0]
+                        input_scale = candidate_input_scale
 
-            # Rewire all consumers of the original norm → norm_out
-            norm_node.replace_all_uses_with(norm_out)
+            if apply_quant_fusion:
+                with graph.inserting_before(norm_node):
+                    fused_target = (
+                        trtllm_fused_add_rms_norm_quant.trtllm_fused_add_rms_norm_fp8_quant
+                        if quant_type == "fp8"
+                        else trtllm_fused_add_rms_norm_quant.trtllm_fused_add_rms_norm_nvfp4_quant
+                    )
+                    fused_node = graph.call_function(
+                        fused_target,
+                        args=(add_rhs, add_lhs, weight, input_scale, eps),
+                    )
+                    quant_out = graph.call_function(operator.getitem, args=(fused_node, 0))
+                    add_out = graph.call_function(operator.getitem, args=(fused_node, 1))
+                    quant_sf = graph.call_function(operator.getitem, args=(fused_node, 2))
 
-            # Erase norm first so cast_node (if present) loses its only user
-            graph.erase_node(norm_node)
-            erased.add(id(norm_node))
+                for user in quant_users:
+                    user_args = list(user.args)
+                    user_kwargs = dict(user.kwargs)
+                    if len(user_args) > 0:
+                        user_args[0] = quant_out
+                    else:
+                        user_kwargs["input"] = quant_out
+
+                    user_kwargs["input_dtype_ref"] = add_out
+                    if quant_type == "nvfp4":
+                        user_kwargs["input_sf"] = quant_sf
+                    user.args = tuple(user_args)
+                    user.kwargs = user_kwargs
+
+                graph.erase_node(norm_node)
+                erased.add(id(norm_node))
+            else:
+                # Insert the fused call right before the norm node. Using
+                # inserting_before(norm_node) ensures correct topological order:
+                # fused_node → norm_out → add_out all appear before norm_node.
+                with graph.inserting_before(norm_node):
+                    # flashinfer_fused_add_rms_norm(x, residual, weight, eps):
+                    #   residual += x        →  residual becomes add result
+                    #   x = rms_norm(residual) →  x becomes norm result
+                    # returns (x, residual) = (norm_result, add_result)
+                    fused_node = graph.call_function(
+                        flashinfer_fused_add_rms_norm,
+                        args=(add_rhs, add_lhs, weight, eps),
+                    )
+                    norm_out = graph.call_function(operator.getitem, args=(fused_node, 0))
+                    add_out = graph.call_function(operator.getitem, args=(fused_node, 1))
+
+                # Rewire all consumers of the original norm → norm_out
+                norm_node.replace_all_uses_with(norm_out)
+
+                # Erase norm first so cast_node (if present) loses its only user
+                graph.erase_node(norm_node)
+                erased.add(id(norm_node))
 
             # Erase cast_node *before* replacing add's uses, otherwise
             # replace_all_uses_with would rewrite cast's input to add_out
@@ -159,3 +215,38 @@ class FuseAddRMSNorm(BaseTransform):
             has_valid_shapes=num_matches == 0,
         )
         return gm, info
+
+    @staticmethod
+    def _quant_linear_type(node: Node) -> Optional[str]:
+        if is_op(node, torch.ops.auto_deploy.trtllm_quant_fp8_linear) or is_op(
+            node, torch.ops.auto_deploy.torch_quant_fp8_linear
+        ):
+            return "fp8"
+        if is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_linear):
+            return "nvfp4"
+        return None
+
+    @staticmethod
+    def _get_arg_or_kwarg(node: Node, key: str, positional_index: int):
+        if key in node.kwargs:
+            return node.kwargs[key]
+        if len(node.args) > positional_index:
+            return node.args[positional_index]
+        return None
+
+    @staticmethod
+    def _extract_input_scale(linear_node: Node):
+        input_scale = FuseAddRMSNorm._get_arg_or_kwarg(linear_node, "input_scale", 3)
+        if isinstance(input_scale, (list, tuple)):
+            if len(input_scale) == 0:
+                return None
+            input_scale = input_scale[0]
+        return input_scale
+
+    @staticmethod
+    def _same_scale(scale_a, scale_b) -> bool:
+        if isinstance(scale_a, Node) or isinstance(scale_b, Node):
+            return scale_a is scale_b
+        if isinstance(scale_a, torch.Tensor) or isinstance(scale_b, torch.Tensor):
+            return scale_a is scale_b
+        return scale_a == scale_b

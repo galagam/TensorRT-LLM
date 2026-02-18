@@ -18,6 +18,7 @@
 #include "tensorrt_llm/kernels/fusedLayernormKernels/layernorm_param.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.h"
 #include "tensorrt_llm/kernels/quantization.h"
+#include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/Functions.h>
@@ -41,21 +42,29 @@ namespace torch_ext
 // input: [M, N] - input tensor (fp16/bf16)
 // residual: [M, N] - residual tensor (fp16/bf16)
 // gamma: [N] - RMSNorm weight (fp16/bf16)
-// sf_scale: [1] - optional scale factor for FP4 quantization (float)
+// sf_scale: [1] - optional per-tensor scale factor used by quantization
 // use_rms_norm: bool - if true use RMSNorm, else use LayerNorm
 // output_hp_norm: bool - if true, also output high precision normalized values (same dtype as input) for MoE gate.
+// quant_mode: int - quantization mode (0: NVFP4, 1: FP8)
 // Returns:
-//   normed_output: [M, N/8] - FP4 quantized normalized output (uint32_t, packed)
+//   normed_output:
+//     - NVFP4 mode: [M, N/8] FP4 quantized normalized output (uint32_t packed)
+//     - FP8 mode: [M, N] FP8 (E4M3) quantized normalized output
 //   output: [M, N] - pre-norm output (input + residual), same dtype as input
-//   sf_out: scale factors for FP4 (uint8_t), swizzled layout
+//   sf_out:
+//     - NVFP4 mode: FP4 scale factors (uint8_t), swizzled layout
+//     - FP8 mode: FP8 per-tensor scale factors (float32)
 //   high_precision_normed_output: [M, N] - normalized output before quant (only if output_hp_norm=true, else empty)
 //
 // NOTE: This kernel requires SM90 (Hopper) or SM100 (Blackwell) GPU architecture.
 // NOTE: Hidden dimension N must be >= 2048 and <= 16384.
 std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_add_rms_norm_quant(
     at::Tensor const& input, at::Tensor const& residual, at::Tensor const& gamma,
-    std::optional<at::Tensor> const& sf_scale, bool use_rms_norm, double eps, bool output_hp_norm)
+    std::optional<at::Tensor> const& sf_scale, bool use_rms_norm, double eps, bool output_hp_norm, int64_t quant_mode)
 {
+    constexpr int64_t kQuantModeNvfp4 = 0;
+    constexpr int64_t kQuantModeFp8 = 1;
+
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
     CHECK_TH_CUDA(residual);
@@ -77,6 +86,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_
 
     TORCH_CHECK(rank == 2, "input should be 2D tensor [M, N].");
     TORCH_CHECK(residual.sizes() == inputShape, "residual shape must match input shape.");
+    TORCH_CHECK(quant_mode == kQuantModeNvfp4 || quant_mode == kQuantModeFp8,
+        "quant_mode must be 0 (NVFP4) or 1 (FP8). Got ", quant_mode);
+
+    bool const isFp8Quantization = quant_mode == kQuantModeFp8;
 
     int64_t const m = inputShape[0];
     int64_t const n = inputShape[1];
@@ -97,34 +110,44 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_
         sfScalePtr = sf_scale.value().data_ptr<float>();
     }
 
-    // Allocate output tensors
-    // normed_output: FP4 packed output [M, N/8] as uint32_t (8 FP4 values packed per uint32)
-    // NOTE: allocate [M_padded, ...] to avoid OOB writes; return a view of [M, ...] to keep API stable.
-    at::Tensor normed_output_padded
+    // Kernel always emits FP4 packed outputs as part of the unified fused add+rms_norm path.
+    // For FP8 mode, these buffers are internal and the final public quantized output is produced
+    // by quantizing the high precision normalized output.
+    at::Tensor kernel_normed_output_padded
         = at::detail::empty_cuda({m_padded, n / 8}, torch::kInt32, input.device(), std::nullopt);
-    at::Tensor normed_output = (m_padded == m) ? normed_output_padded : normed_output_padded.narrow(0, 0, m);
+    at::Tensor kernel_normed_output
+        = (m_padded == m) ? kernel_normed_output_padded : kernel_normed_output_padded.narrow(0, 0, m);
 
     // output: pre-norm output (input + residual) [M, N], same dtype as input
     // NOTE: allocate [M_padded, ...] to avoid OOB writes; return a view of [M, ...] to keep API stable.
     at::Tensor output_padded = at::detail::empty_cuda({m_padded, n}, input.scalar_type(), input.device(), std::nullopt);
     at::Tensor output = (m_padded == m) ? output_padded : output_padded.narrow(0, 0, m);
 
-    // sf_out: scale factors for FP4, swizzled layout
+    // Kernel-emitted FP4 scale factors (internal for FP8 mode).
     // sfVecSize = 16 for FP4 quantization (16 FP4 values share one scale factor)
     int64_t const sfVecSize = 16;
     // NOTE: allocate using m_padded to avoid OOB writes for warp-specialized/vectorized stores when M is not padded.
     // Return a view of the original (un-padded) size to keep the API stable.
     int64_t const sfSize = tensorrt_llm::computeSwizzledLayoutSFSize(m, n / sfVecSize);
     int64_t const sfSizePadded = tensorrt_llm::computeSwizzledLayoutSFSize(m_padded, n / sfVecSize);
-    at::Tensor sf_out_padded = at::detail::empty_cuda({sfSizePadded}, SF_DTYPE, input.device(), std::nullopt);
-    at::Tensor sf_out = (m_padded == m) ? sf_out_padded : sf_out_padded.narrow(0, 0, sfSize);
+    at::Tensor kernel_sf_out_padded = at::detail::empty_cuda({sfSizePadded}, SF_DTYPE, input.device(), std::nullopt);
+    at::Tensor kernel_sf_out = (m_padded == m) ? kernel_sf_out_padded : kernel_sf_out_padded.narrow(0, 0, sfSize);
+
+    at::Tensor normed_output;
+    at::Tensor sf_out;
+
+    bool const kernelNeedsHpOutput = output_hp_norm || isFp8Quantization;
     std::optional<at::Tensor> high_precision_normed_output = std::nullopt;
-    if (output_hp_norm)
+    at::Tensor hp_normed_output;
+    if (kernelNeedsHpOutput)
     {
         at::Tensor hp_normed_output_padded
             = at::detail::empty_cuda({m_padded, n}, input.scalar_type(), input.device(), std::nullopt);
-        high_precision_normed_output
-            = (m_padded == m) ? hp_normed_output_padded : hp_normed_output_padded.narrow(0, 0, m);
+        hp_normed_output = (m_padded == m) ? hp_normed_output_padded : hp_normed_output_padded.narrow(0, 0, m);
+        if (output_hp_norm)
+        {
+            high_precision_normed_output = hp_normed_output;
+        }
     }
 
     // Get number of SMs for persistent kernel
@@ -153,23 +176,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_
     {                                                                                                                  \
         using Param = tensorrt_llm::kernels::GeneralFP4AddBiasResidualPreLayerNormParam<T>;                            \
         tensorrt_llm::kernels::WarpSpecializedParam<Param> param;                                                      \
-        param.normed_output = reinterpret_cast<uint32_t*>(normed_output.data_ptr());                                   \
+        param.normed_output = reinterpret_cast<uint32_t*>(kernel_normed_output.data_ptr());                            \
         param.output = reinterpret_cast<T*>(output.data_ptr());                                                        \
         param.input = const_cast<T*>(reinterpret_cast<T const*>(input.data_ptr()));                                    \
         param.sf_scale = sfScalePtr;                                                                                   \
-        param.sf_out = reinterpret_cast<uint32_t*>(sf_out.data_ptr());                                                 \
+        param.sf_out = reinterpret_cast<uint32_t*>(kernel_sf_out.data_ptr());                                          \
         param.residual = reinterpret_cast<T const*>(residual.data_ptr());                                              \
         param.bias = nullptr;                                                                                          \
         param.gamma = reinterpret_cast<T const*>(gamma.data_ptr());                                                    \
         param.beta = nullptr;                                                                                          \
         param.high_precision_normed_output                                                                             \
-            = output_hp_norm ? reinterpret_cast<T*>(high_precision_normed_output.value().data_ptr()) : nullptr;        \
+            = kernelNeedsHpOutput ? reinterpret_cast<T*>(hp_normed_output.data_ptr()) : nullptr;                       \
         param.m = static_cast<int>(m);                                                                                 \
         param.n = static_cast<int>(n);                                                                                 \
         param.layernorm_eps = static_cast<float>(eps);                                                                 \
         param.stream = stream;                                                                                         \
         param.counters = counters;                                                                                     \
-        tensorrt_llm::kernels::invokeWSLayerNorm<Param>(param, use_rms_norm, multiProcessorCount, output_hp_norm);     \
+        tensorrt_llm::kernels::invokeWSLayerNorm<Param>(                                                               \
+            param, use_rms_norm, multiProcessorCount, kernelNeedsHpOutput);                                            \
     } while (0)
 
     if (input.scalar_type() == at::ScalarType::Half)
@@ -191,6 +215,27 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_
     }
 
 #undef LAUNCH_FUSED_ADD_RMS_NORM_QUANT
+    if (isFp8Quantization)
+    {
+        std::tuple<at::Tensor, at::Tensor> fp8Quantized;
+        if (sf_scale.has_value())
+        {
+            fp8Quantized
+                = tensorrt_llm::torch_ext::symmetric_static_quantize_per_tensor(hp_normed_output, sf_scale.value());
+        }
+        else
+        {
+            fp8Quantized = tensorrt_llm::torch_ext::symmetric_quantize_per_tensor(hp_normed_output);
+        }
+        normed_output = std::get<0>(fp8Quantized);
+        sf_out = std::get<1>(fp8Quantized);
+    }
+    else
+    {
+        normed_output = kernel_normed_output;
+        sf_out = kernel_sf_out;
+    }
+
     // No explicit sync needed - kernel runs asynchronously on the stream
     return std::make_tuple(normed_output, output, sf_out, high_precision_normed_output);
 }
@@ -203,7 +248,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_add_rms_norm_quant(Tensor input, Tensor residual, Tensor gamma, "
-        "Tensor? sf_scale, bool use_rms_norm=True, float eps=1e-6, bool output_hp_norm=False) -> (Tensor, Tensor, "
+        "Tensor? sf_scale, bool use_rms_norm=True, float eps=1e-6, bool output_hp_norm=False, int quant_mode=0) -> "
+        "(Tensor, Tensor, "
         "Tensor, Tensor?)");
 }
 

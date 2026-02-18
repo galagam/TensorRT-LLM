@@ -51,6 +51,40 @@ def test_fp8_linear(M, N, K, bias):
     torch.testing.assert_close(output_fp8_trtllm, output_fp8_torch, rtol=0.01, atol=0.05)
 
 
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_fp8_linear_prequantized_input_path(bias):
+    m, n, k = 8, 32, 64
+    input = torch.rand(m, k, device="cuda", dtype=torch.float16)
+    weight = torch.rand(n, k, device="cuda", dtype=torch.float16)
+    bias_tensor = torch.rand(n, device="cuda", dtype=torch.float16) if bias else None
+
+    input_scale = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    weight_scale = (torch.max(torch.abs(weight)) / 448).to(torch.float32)
+    weight_fp8 = (weight / weight_scale).to(torch.float8_e4m3fn)
+
+    output_ref = torch.ops.auto_deploy.trtllm_quant_fp8_linear(
+        input,
+        weight_fp8,
+        bias=bias_tensor,
+        input_scale=input_scale,
+        weight_scale=weight_scale,
+    )
+
+    input_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(input, input_scale)
+    output_prequant = torch.ops.auto_deploy.trtllm_quant_fp8_linear(
+        input_fp8,
+        weight_fp8,
+        bias=bias_tensor,
+        input_scale=input_scale,
+        weight_scale=weight_scale,
+        input_dtype_ref=input,
+    )
+
+    assert output_prequant.shape == output_ref.shape
+    torch.testing.assert_close(output_prequant, output_ref, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.skipif(
     not fp4_compatible() or not trtllm_ops_available(),
     reason="Requires fp4 and trtllm support",
@@ -78,6 +112,51 @@ def test_fp4_linear():
 
     assert output_fp4_gemm.shape == output_fp16_gemm.shape
     assert torch.allclose(output_fp4_gemm, output_fp16_gemm, rtol=1e-1, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not (fp4_compatible() and trtllm_ops_available()),
+    reason="Requires NVFP4 and TRT-LLM ops",
+)
+def test_fp4_linear_prequantized_input_path():
+    input = torch.rand(2, 3, 64, dtype=torch.half, device="cuda")
+    weight = torch.rand(128, 64, dtype=torch.half, device="cuda")
+
+    input_scale = fp4_global_scale(input)
+    weight_scale_2 = fp4_global_scale(weight)
+    alpha = 1 / (input_scale * weight_scale_2)
+
+    weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(
+        weight, weight_scale_2, SCALING_VECTOR_SIZE, False
+    )
+
+    output_ref = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
+        input,
+        weight_fp4,
+        bias=None,
+        input_scale=input_scale,
+        weight_scale=weight_scale,
+        alpha=alpha,
+    )
+
+    input_2d = input.reshape(-1, input.shape[-1])
+    input_fp4, input_sf = torch.ops.trtllm.fp4_quantize(
+        input_2d, input_scale, SCALING_VECTOR_SIZE, False
+    )
+    input_fp4 = input_fp4.reshape(*input.shape[:-1], input.shape[-1] // 2)
+    output_prequant = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
+        input_fp4,
+        weight_fp4,
+        bias=None,
+        input_scale=input_scale,
+        weight_scale=weight_scale,
+        alpha=alpha,
+        input_sf=input_sf,
+        input_dtype_ref=input,
+    )
+
+    assert output_prequant.shape == output_ref.shape
+    torch.testing.assert_close(output_prequant, output_ref, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])

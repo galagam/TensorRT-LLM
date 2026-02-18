@@ -1004,21 +1004,34 @@ def _register_fake():
         use_rms_norm: bool = True,
         eps: float = 1e-5,
         output_hp_norm: bool = False,
+        quant_mode: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                Optional[torch.Tensor]]:
         m, n = input.shape
-        # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
-        normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
         # output: [M, N] pre-norm output, same dtype as input
         output = input.new_empty((m, n), dtype=input.dtype)
-        # sf_out: scale factors, swizzled layout
-        sf_vec_size = 16
-        sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
-        sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
+
+        if quant_mode == 0:
+            # NVFP4 output: [M, N/8] int32 (8 FP4 values packed per int32)
+            normed_output = input.new_empty((m, n // 8), dtype=torch.int32)
+            # NVFP4 scale factors in swizzled layout.
+            sf_vec_size = 16
+            sf_size = ((m + 127) // 128) * 128 * (
+                (n // sf_vec_size + 3) // 4) * 4
+            sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
+        elif quant_mode == 1:
+            # FP8 output keeps full activation shape.
+            normed_output = input.new_empty((m, n), dtype=torch.float8_e4m3fn)
+            sf_out = input.new_empty((1, ), dtype=torch.float32)
+        else:
+            raise ValueError(
+                f"Unsupported quant_mode={quant_mode}. Expected 0 (NVFP4) or 1 (FP8)."
+            )
+
         # high_precision_normed_output: [M, N] optional, only when output_hp_norm=True
         hp_output = input.new_empty(
             (m, n), dtype=input.dtype) if output_hp_norm else None
-        return normed_output_fp4, output, sf_out, hp_output
+        return normed_output, output, sf_out, hp_output
 
     @torch.library.register_fake("trtllm::fused_relu2_quantize")
     def _(

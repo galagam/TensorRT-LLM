@@ -1,5 +1,6 @@
 import operator
 
+import pytest
 import torch
 from torch.export import Dim
 
@@ -7,6 +8,10 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.flashinfer_fused_a
     flashinfer_fused_add_rms_norm,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import *  # noqa
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.trtllm_fused_add_rms_norm_quant import (  # noqa
+    trtllm_fused_add_rms_norm_fp8_quant,
+    trtllm_fused_add_rms_norm_nvfp4_quant,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.fused_add_rms_norm import FuseAddRMSNorm
@@ -116,6 +121,70 @@ class ChainedModel(torch.nn.Module):
         return branch1 + branch2, add2
 
 
+class AddNormFp8LinearModel(torch.nn.Module):
+    """Pattern: add + rms_norm + FP8 linear."""
+
+    def __init__(self, hidden_size=128, out_features=96, eps=1e-5):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.ones(hidden_size, device="cuda", dtype=torch.bfloat16)
+        )
+        fp16_weight = torch.randn(out_features, hidden_size, device="cuda", dtype=torch.float16)
+        weight_scale = (fp16_weight.abs().max() / 448.0).to(torch.float32)
+        self.register_buffer("weight_fp8", (fp16_weight / weight_scale).to(torch.float8_e4m3fn))
+        self.register_buffer("weight_scale", weight_scale)
+        self.register_buffer("input_scale", torch.tensor(1.0, device="cuda", dtype=torch.float32))
+        self.eps = eps
+
+    def forward(self, x, residual):
+        added = x + residual
+        norm = torch.ops.auto_deploy.flashinfer_rms_norm(added, self.weight, self.eps)
+        return torch.ops.auto_deploy.trtllm_quant_fp8_linear(
+            norm,
+            self.weight_fp8,
+            bias=None,
+            input_scale=self.input_scale,
+            weight_scale=self.weight_scale,
+        )
+
+
+class AddNormNvfp4LinearModel(torch.nn.Module):
+    """Pattern: add + rms_norm + NVFP4 linear."""
+
+    def __init__(self, hidden_size=128, out_features=96, eps=1e-5):
+        super().__init__()
+        assert hidden_size % 16 == 0
+        self.weight = torch.nn.Parameter(
+            torch.ones(hidden_size, device="cuda", dtype=torch.float16)
+        )
+        fp16_weight = torch.randn(out_features, hidden_size, device="cuda", dtype=torch.float16)
+        weight_scale_2 = (fp16_weight.abs().max() / (6.0 * 448.0)).to(torch.float32)
+        weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(
+            fp16_weight,
+            weight_scale_2,
+            16,
+            False,
+        )
+        input_scale = torch.tensor(1.0 / (6.0 * 448.0), device="cuda", dtype=torch.float32)
+        self.register_buffer("weight_fp4", weight_fp4)
+        self.register_buffer("weight_scale", weight_scale)
+        self.register_buffer("input_scale", input_scale)
+        self.register_buffer("alpha", (1.0 / (input_scale * weight_scale_2)).to(torch.float32))
+        self.eps = eps
+
+    def forward(self, x, residual):
+        added = x + residual
+        norm = torch.ops.auto_deploy.flashinfer_rms_norm(added, self.weight, self.eps)
+        return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
+            norm,
+            self.weight_fp4,
+            bias=None,
+            input_scale=self.input_scale,
+            weight_scale=self.weight_scale,
+            alpha=self.alpha,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -138,6 +207,22 @@ def _count_rms_norm_ops(gm):
 def _count_add_ops(gm):
     """Count aten.add.Tensor calls in the graph."""
     return sum(1 for n in gm.graph.nodes if is_op(n, torch.ops.aten.add.Tensor))
+
+
+def _count_trtllm_fused_add_rms_norm_fp8_quant_ops(gm):
+    return sum(
+        1
+        for n in gm.graph.nodes
+        if n.op == "call_function" and n.target is trtllm_fused_add_rms_norm_fp8_quant
+    )
+
+
+def _count_trtllm_fused_add_rms_norm_nvfp4_quant_ops(gm):
+    return sum(
+        1
+        for n in gm.graph.nodes
+        if n.op == "call_function" and n.target is trtllm_fused_add_rms_norm_nvfp4_quant
+    )
 
 
 def _export_model(model, *inputs, dynamic_dim0=True):
@@ -295,3 +380,58 @@ def test_fuse_add_rms_norm_chained():
     y_ref = model(embed.clone(), attn_out.clone(), mlp_out.clone())
     torch.testing.assert_close(y_fused[0], y_ref[0], atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(y_fused[1], y_ref[1], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    (not torch.cuda.is_available()) or torch.cuda.get_device_capability(0) < (8, 9),
+    reason="Requires FP8 support",
+)
+def test_fuse_add_rms_norm_quant_fp8():
+    model = AddNormFp8LinearModel()
+    bsz, seq_len, hidden = 2, 8, 128
+    x = torch.randn(bsz, seq_len, hidden, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+
+    gm = _export_model(model, x, residual)
+    gm_t, info = _apply_transform_direct(gm)
+    assert info.num_matches == 1, f"Expected 1 match, got {info.num_matches}"
+    assert _count_trtllm_fused_add_rms_norm_fp8_quant_ops(gm_t) == 1
+    assert _count_rms_norm_ops(gm_t) == 0
+
+    linear_nodes = [
+        n for n in gm_t.graph.nodes if is_op(n, torch.ops.auto_deploy.trtllm_quant_fp8_linear)
+    ]
+    assert len(linear_nodes) == 1
+    assert "input_dtype_ref" in linear_nodes[0].kwargs
+
+    y_fused = gm_t(x.clone(), residual.clone())
+    y_ref = model(x.clone(), residual.clone())
+    torch.testing.assert_close(y_fused, y_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    (not torch.cuda.is_available()) or torch.cuda.get_device_capability(0) < (10, 0),
+    reason="Requires NVFP4 support",
+)
+def test_fuse_add_rms_norm_quant_nvfp4():
+    model = AddNormNvfp4LinearModel()
+    bsz, seq_len, hidden = 2, 8, 128
+    x = torch.randn(bsz, seq_len, hidden, device="cuda", dtype=torch.float16)
+    residual = torch.randn_like(x)
+
+    gm = _export_model(model, x, residual)
+    gm_t, info = _apply_transform_direct(gm)
+    assert info.num_matches == 1, f"Expected 1 match, got {info.num_matches}"
+    assert _count_trtllm_fused_add_rms_norm_nvfp4_quant_ops(gm_t) == 1
+    assert _count_rms_norm_ops(gm_t) == 0
+
+    linear_nodes = [
+        n for n in gm_t.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear)
+    ]
+    assert len(linear_nodes) == 1
+    assert "input_dtype_ref" in linear_nodes[0].kwargs
+    assert "input_sf" in linear_nodes[0].kwargs
+
+    y_fused = gm_t(x.clone(), residual.clone())
+    y_ref = model(x.clone(), residual.clone())
+    torch.testing.assert_close(y_fused, y_ref, atol=5e-2, rtol=5e-2)

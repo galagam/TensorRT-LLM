@@ -25,6 +25,16 @@ def fused_add_rms_norm_quant_available():
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_add_rms_norm_quant")
 
 
+def fused_add_rms_norm_quant_supports_quant_mode():
+    if not fused_add_rms_norm_quant_available():
+        return False
+    try:
+        schema = str(torch.ops.trtllm.fused_add_rms_norm_quant.default._schema)
+    except Exception:
+        return False
+    return "quant_mode" in schema
+
+
 skip_unsupported = pytest.mark.skipif(
     getSMVersion() < 100 or not fused_add_rms_norm_quant_available(),
     reason="Requires Blackwell+ (SM100+) and trtllm.fused_add_rms_norm_quant op",
@@ -260,6 +270,52 @@ def test_fused_add_rms_norm_quant_gamma_weight(dtype):
     torch.testing.assert_close(hp_normed_output, normed_ref, rtol=1e-2, atol=1e-2)
 
     # Verify residual output matches reference
+    torch.testing.assert_close(residual_out, residual_ref, rtol=1e-3, atol=1e-3)
+
+
+@skip_unsupported
+@pytest.mark.skipif(
+    not fused_add_rms_norm_quant_supports_quant_mode(),
+    reason="fused_add_rms_norm_quant does not expose quant_mode in this build",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_add_rms_norm_quant_fp8_mode(dtype):
+    """Test fused_add_rms_norm_quant in FP8 quantization mode."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    m, n = 32, 2048
+    hidden_states = torch.randn(m, n, dtype=dtype, device=device)
+    residual = torch.randn(m, n, dtype=dtype, device=device)
+    gamma = torch.randn(n, dtype=dtype, device=device) * 0.5 + 1.0
+
+    eps = 1e-6
+    normed_ref, residual_ref = rms_norm_ref(hidden_states, residual, gamma, eps)
+    fp8_scale = (normed_ref.abs().amax().float() / 448.0).view(1)
+
+    quantized_fp8, residual_out, out_scale, hp_normed_output = (
+        torch.ops.trtllm.fused_add_rms_norm_quant(
+            hidden_states,
+            residual,
+            gamma,
+            fp8_scale,
+            True,
+            eps=eps,
+            output_hp_norm=True,
+            quant_mode=1,
+        )
+    )
+
+    assert quantized_fp8.shape == (m, n)
+    assert quantized_fp8.dtype == torch.float8_e4m3fn
+    assert residual_out.shape == (m, n)
+    assert residual_out.dtype == dtype
+    assert out_scale.dtype == torch.float32
+    assert out_scale.numel() >= 1
+    assert hp_normed_output.shape == (m, n)
+    assert hp_normed_output.dtype == dtype
+
+    torch.testing.assert_close(hp_normed_output, normed_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(residual_out, residual_ref, rtol=1e-3, atol=1e-3)
 
 
