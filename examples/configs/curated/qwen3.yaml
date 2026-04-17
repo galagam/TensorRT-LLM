@@ -1,5 +1,6 @@
 max_batch_size: 161
 max_num_tokens: 1160
+tensor_parallel_size: 8
 moe_expert_parallel_size: 1
 cuda_graph_config:
   enable_padding: true
