@@ -149,6 +149,15 @@ def build_ad_config(yaml_extra: List[str], trtllm_root: Path) -> dict:
     return merged
 
 
+def resolve_local_model_path(model: str) -> Optional[str]:
+    """Return local HF snapshot path for model, or None if not cached."""
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(model, local_files_only=True)
+    except Exception:
+        return None
+
+
 def lookup_pt_config(
     model: str, trtllm_root: Path, prefer_scenario: str = "Max Throughput"
 ) -> Optional[str]:
@@ -526,6 +535,23 @@ def main():
             else:
                 pt_config_full = str(trtllm_root / pt_config_rel)
                 logger.log(f"PT config: {pt_config_rel}")
+
+                # Inject local tokenizer path so trtllm-serve never contacts HF Hub.
+                local_model_path = resolve_local_model_path(model)
+                if local_model_path:
+                    logger.log(f"PT local tokenizer: {local_model_path}")
+                    with open(pt_config_full) as f:
+                        pt_cfg = yaml.safe_load(f) or {}
+                    pt_cfg["tokenizer"] = local_model_path
+                    pt_cfg["postprocess_tokenizer_dir"] = local_model_path
+                    pt_tmp = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".yaml", prefix="pt_cfg_", delete=False
+                    )
+                    yaml.dump(pt_cfg, pt_tmp)
+                    pt_tmp.flush()
+                    pt_config_full = pt_tmp.name
+                else:
+                    logger.log(f"WARNING: {model} not in local HF cache; tokenizer may fail if Hub is unavailable")
 
                 pt_result_base = artifacts_dir / f"{model_slug}_pt"
                 pt_tag = f"{model_slug}-ws{world_size}-pt"[:64]
