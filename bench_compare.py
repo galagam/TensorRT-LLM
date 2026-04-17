@@ -315,6 +315,8 @@ def run_sweep(
         return None, True, port
 
     result_base.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["pkill", "-f", "trtllm-serve"], check=False)
+    time.sleep(2)
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
