@@ -436,6 +436,9 @@ def main():
 
     for wl_idx, wl in enumerate(workloads):
         model: str = wl["model"]
+        # model_path: optional local path passed to sweep/trtllm-serve instead of
+        # the HF model ID. The HF ID (model) is still used for registry lookups.
+        model_path: str = wl.get("model_path", model)
         world_size: int = int(wl.get("world_size", 1))
         isl: int = int(wl["isl"])
         osl: int = int(wl["osl"])
@@ -499,7 +502,7 @@ def main():
                 ad_tag = f"{model_slug}-ws{world_size}-ad"[:64]
 
                 run_dir, success, current_port = run_sweep(
-                    model=model,
+                    model=model_path,
                     config_path=ad_config_path,
                     server_type="trtllm-autodeploy",
                     world_size=world_size,
@@ -549,9 +552,16 @@ def main():
                 logger.log(f"PT config: {pt_config_rel}")
 
                 # Inject local tokenizer path so trtllm-serve never contacts HF Hub.
-                local_model_path = resolve_local_model_path(model)
+                # If model_path is a local directory, use it directly; otherwise
+                # fall back to resolving from the HF snapshot cache.
+                if model_path != model:
+                    local_model_path: Optional[str] = model_path
+                    logger.log(f"PT local tokenizer (from model_path): {local_model_path}")
+                else:
+                    local_model_path = resolve_local_model_path(model)
                 if local_model_path:
-                    logger.log(f"PT local tokenizer: {local_model_path}")
+                    if model_path == model:
+                        logger.log(f"PT local tokenizer: {local_model_path}")
                     with open(pt_config_full) as f:
                         pt_cfg = yaml.safe_load(f) or {}
                     pt_cfg["tokenizer"] = local_model_path
@@ -569,7 +579,7 @@ def main():
                 pt_tag = f"{model_slug}-ws{world_size}-pt"[:64]
 
                 run_dir, _, current_port = run_sweep(
-                    model=model,
+                    model=model_path,
                     config_path=pt_config_full,
                     server_type="trtllm-pytorch",
                     world_size=None,  # PT world_size is set in config YAML, not CLI
