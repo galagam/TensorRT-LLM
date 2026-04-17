@@ -163,13 +163,28 @@ def resolve_local_model_path(model: str) -> Optional[str]:
         return None
 
 
+def _detect_gpu_compat_tag() -> Optional[str]:
+    """Return a gpu_compatibility tag matching the current GPU (e.g. 'B200', 'H100')."""
+    try:
+        import torch
+        major, _ = torch.cuda.get_device_capability()
+        if major == 10:
+            return "B200"
+        if major == 9:
+            return "H100"
+    except Exception:
+        pass
+    return None
+
+
 def lookup_pt_config(
     model: str, trtllm_root: Path, prefer_scenario: str = "Max Throughput"
 ) -> Optional[str]:
     """Return config_path for model from pytorch curated lookup.yaml.
 
-    Prefers `prefer_scenario`; falls back to first non-disaggregated match.
-    Returns None if model is not found.
+    Filters by gpu_compatibility (detected at runtime) when entries have that
+    field, then prefers `prefer_scenario`; falls back to first non-disaggregated
+    GPU-compatible match. Returns None if model is not found.
     """
     lookup_yaml = trtllm_root / "examples/configs/curated/lookup.yaml"
     with open(lookup_yaml) as f:
@@ -178,6 +193,12 @@ def lookup_pt_config(
     matches = [e for e in entries if e.get("model") == model and not e.get("disagg", False)]
     if not matches:
         return None
+
+    gpu_tag = _detect_gpu_compat_tag()
+    if gpu_tag:
+        compat = [e for e in matches if gpu_tag in e.get("gpu_compatibility", "")]
+        if compat:
+            matches = compat
 
     for entry in matches:
         if entry.get("scenario", "") == prefer_scenario:
