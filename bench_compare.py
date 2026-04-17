@@ -617,10 +617,12 @@ def main():
     # Header: model, world_size, ISL/OSL, concurrency,
     #         autodeploy <metric1>, ..., pytorch <metric1>, ...
     csv_headers = ["model", "world_size", "ISL/OSL", "concurrency"]
-    for m in metrics:
-        csv_headers.append(f"autodeploy {metric_display_name(m)}")
-    for m in metrics:
-        csv_headers.append(f"pytorch {metric_display_name(m)}")
+    if "autodeploy" in args.backends:
+        for m in metrics:
+            csv_headers.append(f"autodeploy {metric_display_name(m)}")
+    if "pytorch" in args.backends:
+        for m in metrics:
+            csv_headers.append(f"pytorch {metric_display_name(m)}")
 
     def fmt(v: Optional[float]) -> str:
         return f"{v:.2f}" if v is not None else "N/A"
@@ -635,14 +637,16 @@ def main():
                 "ISL/OSL": f"{isl}/{osl}",
                 "concurrency": conc,
             }
-            for m in metrics:
-                row[f"autodeploy {metric_display_name(m)}"] = fmt(
-                    backend_results["autodeploy"].get(m)
-                )
-            for m in metrics:
-                row[f"pytorch {metric_display_name(m)}"] = fmt(
-                    backend_results["pytorch"].get(m)
-                )
+            if "autodeploy" in args.backends:
+                for m in metrics:
+                    row[f"autodeploy {metric_display_name(m)}"] = fmt(
+                        backend_results["autodeploy"].get(m)
+                    )
+            if "pytorch" in args.backends:
+                for m in metrics:
+                    row[f"pytorch {metric_display_name(m)}"] = fmt(
+                        backend_results["pytorch"].get(m)
+                    )
             writer.writerow(row)
 
     # ── Final log summary ─────────────────────────────────────────────────────
