@@ -95,4 +95,3 @@
   config_path: examples/configs/curated/kimi-k2-thinking.yaml
   scenario: Max Throughput
   gpu_compatibility: "B200, GB200"
-  disagg: true
