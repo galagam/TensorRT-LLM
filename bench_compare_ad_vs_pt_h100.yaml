@@ -39,12 +39,6 @@ workloads:
     osl: 1024
     concurrencies: [16, 64, 256]
 
-  - model: deepseek-ai/DeepSeek-R1-0528
-    world_size: 8
-    isl: 1024
-    osl: 1024
-    concurrencies: [16, 64, 256]
-
 metrics:
   - output_token_throughput
   - output_token_throughput_per_user
