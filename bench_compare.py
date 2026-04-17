@@ -49,7 +49,7 @@ import argparse
 import csv
 import json
 import os
-import socket
+
 import subprocess
 import sys
 import tempfile
@@ -62,26 +62,7 @@ from typing import Dict, List, Optional, Tuple
 import yaml
 
 
-_DEFAULT_PORT = 8123
-_PORT_WAIT_TIMEOUT_SEC = 60.0
-
-
-def _wait_port_free(port: int, timeout: float = _PORT_WAIT_TIMEOUT_SEC) -> int:
-    """Poll until port is no longer accepting connections (server fully gone).
-
-    Returns the port that is free: same port if freed within timeout, or port+1
-    if something is still holding it after timeout (escalation fallback).
-    """
-    probe_host = "127.0.0.1"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((probe_host, port), timeout=1.0):
-                time.sleep(0.5)
-        except (ConnectionRefusedError, OSError):
-            return port
-    # Timed out — escalate to next port so the next sweep isn't blocked.
-    return port + 1
+_DEFAULT_PORT = 8100
 
 
 # ── Metric name aliases → canonical JSON field ─────────────────────────────────
@@ -315,23 +296,14 @@ def run_sweep(
         return None, True, port
 
     result_base.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["pkill", "-f", "trtllm-serve"], check=False)
-    time.sleep(2)
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         logger.log(f"FAILED: sweep exited with code {e.returncode}")
-        next_port = _wait_port_free(port)
-        if next_port != port:
-            logger.log(f"WARNING: port {port} still held after {_PORT_WAIT_TIMEOUT_SEC:.0f}s; escalating to port {next_port}")
-        return None, False, next_port
+        return None, False, port + 1
     except FileNotFoundError:
         logger.log("FAILED: 'sweep' command not found. Is ad-perf-utils installed?")
-        return None, False, port
-
-    next_port = _wait_port_free(port)
-    if next_port != port:
-        logger.log(f"WARNING: port {port} still held after {_PORT_WAIT_TIMEOUT_SEC:.0f}s; escalating to port {next_port}")
+        return None, False, port + 1
 
     run_dir = find_latest_run(result_base)
     if run_dir is None:
@@ -339,7 +311,7 @@ def run_sweep(
         return None, False, next_port
 
     logger.log(f"SUCCESS: results at {run_dir}")
-    return run_dir, True, next_port
+    return run_dir, True, port + 1
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
