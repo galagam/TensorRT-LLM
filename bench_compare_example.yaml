@@ -1,0 +1,31 @@
+# Example config for bench_compare.py
+#
+# Usage:
+#   python bench_compare.py --config bench_compare_example.yaml --dry-run
+
+workloads:
+  - model: meta-llama/Llama-3.3-70B-Instruct
+    world_size: 4
+    isl: 1024
+    osl: 1024
+    concurrencies: [32, 64]
+
+  - model: deepseek-ai/DeepSeek-R1
+    world_size: 8
+    isl: 1024
+    osl: 2048
+    concurrencies: [32, 64]
+
+# Supported metric names (and their aliases):
+#   output_token_throughput       (aliases: output tps, otps)
+#   output_token_throughput_per_user  (aliases: user tps, utps)
+#   time_to_first_token           (alias: ttft)
+#   inter_token_latency           (alias: itl)
+#   request_latency
+#   request_throughput            (alias: rps)
+#   total_token_throughput
+#
+# "avg" is always used when a metric has multiple percentile values.
+metrics:
+  - output_token_throughput
+  - output_token_throughput_per_user

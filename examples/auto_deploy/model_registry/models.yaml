@@ -125,6 +125,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: meta-llama/Llama-3.3-70B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
+- name: nvidia/Llama-3.3-70B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
 - name: meta-llama/CodeLlama-34b-Instruct-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: meta-llama/Llama-2-13b-chat-hf
@@ -146,6 +148,8 @@ models:
 - name: nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
 - name: Qwen/QwQ-32B-Preview
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -203,6 +207,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
 - name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'super_v3.yaml']
 - name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'super_v3_mtp.yaml']
 - name: zai-org/GLM-4.7-Flash
@@ -235,6 +243,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 # --- Kimi-K2.5 (Jan 2026) ---
 - name: moonshotai/Kimi-K2.5
+  yaml_extra: ['kimi_k2.yaml']
+- name: nvidia/Kimi-K2-Thinking-NVFP4
   yaml_extra: ['kimi_k2.yaml']
 # --- GLM-4.7 (Dec 2025) ---
 - name: zai-org/GLM-4.7
