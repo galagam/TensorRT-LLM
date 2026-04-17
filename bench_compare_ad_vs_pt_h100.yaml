@@ -16,19 +16,19 @@ workloads:
     concurrencies: [16, 64, 256]
 
   - model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
-    world_size: 4
+    world_size: 8
     isl: 1024
     osl: 1024
     concurrencies: [16, 64, 256]
 
   - model: nvidia/Llama-3.3-70B-Instruct-FP8
-    world_size: 4
+    world_size: 8
     isl: 1024
     osl: 1024
     concurrencies: [16, 64, 256]
 
   - model: openai/gpt-oss-120b
-    world_size: 4
+    world_size: 8
     isl: 1024
     osl: 1024
     concurrencies: [16, 64, 256]
