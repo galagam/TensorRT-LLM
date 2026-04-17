@@ -1,0 +1,19 @@
+# Short benchmark comparison: AutoDeploy vs PyTorch backend
+# Run with: python bench_compare.py --config bench_compare_ad_vs_pt_short.yaml
+
+workloads:
+  - model: nvidia/Llama-3.1-8B-Instruct-FP8
+    world_size: 2
+    isl: 1024
+    osl: 1024
+    concurrencies: [8, 16]
+
+  - model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+    world_size: 4
+    isl: 1024
+    osl: 1024
+    concurrencies: [8, 16]
+
+metrics:
+  - output_token_throughput
+  - output_token_throughput_per_user
