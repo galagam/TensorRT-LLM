@@ -49,15 +49,39 @@ import argparse
 import csv
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import yaml
+
+
+_DEFAULT_PORT = 8123
+_PORT_WAIT_TIMEOUT_SEC = 60.0
+
+
+def _wait_port_free(port: int, timeout: float = _PORT_WAIT_TIMEOUT_SEC) -> int:
+    """Poll until port is no longer accepting connections (server fully gone).
+
+    Returns the port that is free: same port if freed within timeout, or port+1
+    if something is still holding it after timeout (escalation fallback).
+    """
+    probe_host = "127.0.0.1"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((probe_host, port), timeout=1.0):
+                time.sleep(0.5)
+        except (ConnectionRefusedError, OSError):
+            return port
+    # Timed out — escalate to next port so the next sweep isn't blocked.
+    return port + 1
 
 
 # ── Metric name aliases → canonical JSON field ─────────────────────────────────
@@ -256,10 +280,13 @@ def run_sweep(
     extra_sweep_args: List[str],
     logger: Logger,
     dry_run: bool,
-) -> Tuple[Optional[Path], bool]:
+    port: int = _DEFAULT_PORT,
+) -> Tuple[Optional[Path], bool, int]:
     """Invoke sweep for one (model, backend) pair.
 
-    Returns (run_dir, success). run_dir is None on failure or dry_run.
+    Returns (run_dir, success, next_port). run_dir is None on failure or dry_run.
+    next_port is the port to pass to the next run_sweep call: same as port if freed
+    within timeout, or port+1 if the port was still occupied (escalation fallback).
     """
     conc_str = " ".join(str(c) for c in concurrencies)
     cmd = [
@@ -275,6 +302,7 @@ def run_sweep(
         "--tag", tag,
         "--result-base-dir", str(result_base),
         "--warmup-requests", warmup_requests,
+        "--port", str(port),
     ]
     if world_size is not None and server_type == "trtllm-autodeploy":
         cmd += ["--world-size", str(world_size)]
@@ -284,25 +312,32 @@ def run_sweep(
 
     if dry_run:
         logger.log("DRY RUN: skipping execution")
-        return None, True
+        return None, True, port
 
     result_base.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         logger.log(f"FAILED: sweep exited with code {e.returncode}")
-        return None, False
+        next_port = _wait_port_free(port)
+        if next_port != port:
+            logger.log(f"WARNING: port {port} still held after {_PORT_WAIT_TIMEOUT_SEC:.0f}s; escalating to port {next_port}")
+        return None, False, next_port
     except FileNotFoundError:
         logger.log("FAILED: 'sweep' command not found. Is ad-perf-utils installed?")
-        return None, False
+        return None, False, port
+
+    next_port = _wait_port_free(port)
+    if next_port != port:
+        logger.log(f"WARNING: port {port} still held after {_PORT_WAIT_TIMEOUT_SEC:.0f}s; escalating to port {next_port}")
 
     run_dir = find_latest_run(result_base)
     if run_dir is None:
         logger.log(f"WARNING: latest_run symlink not found in {result_base}")
-        return None, False
+        return None, False, next_port
 
     logger.log(f"SUCCESS: results at {run_dir}")
-    return run_dir, True
+    return run_dir, True, next_port
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
@@ -423,6 +458,8 @@ def main():
     ResultKey = Tuple[str, int, int, int, int]
     all_results: Dict[ResultKey, Dict[str, Dict[str, Optional[float]]]] = {}
 
+    current_port: int = _DEFAULT_PORT  # threaded across sweeps; escalates on timeout
+
     for wl_idx, wl in enumerate(workloads):
         model: str = wl["model"]
         world_size: int = int(wl.get("world_size", 1))
@@ -487,7 +524,7 @@ def main():
                 # Trim tag to keep directory names reasonable
                 ad_tag = f"{model_slug}-ws{world_size}-ad"[:64]
 
-                run_dir, success = run_sweep(
+                run_dir, success, current_port = run_sweep(
                     model=model,
                     config_path=ad_config_path,
                     server_type="trtllm-autodeploy",
@@ -503,6 +540,7 @@ def main():
                     extra_sweep_args=extra_sweep_args,
                     logger=logger,
                     dry_run=args.dry_run,
+                    port=current_port,
                 )
                 if run_dir:
                     ad_results = parse_sweep_results(run_dir, isl, osl, concurrencies, metrics)
@@ -556,7 +594,7 @@ def main():
                 pt_result_base = artifacts_dir / f"{model_slug}_pt"
                 pt_tag = f"{model_slug}-ws{world_size}-pt"[:64]
 
-                run_dir, _ = run_sweep(
+                run_dir, _, current_port = run_sweep(
                     model=model,
                     config_path=pt_config_full,
                     server_type="trtllm-pytorch",
@@ -572,6 +610,7 @@ def main():
                     extra_sweep_args=extra_sweep_args,
                     logger=logger,
                     dry_run=args.dry_run,
+                    port=current_port,
                 )
                 if run_dir:
                     pt_results = parse_sweep_results(run_dir, isl, osl, concurrencies, metrics)
