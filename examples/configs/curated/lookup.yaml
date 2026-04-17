@@ -70,6 +70,16 @@
   config_path: examples/configs/curated/gpt-oss-120b-throughput.yaml
   scenario: Max Throughput
   gpu_compatibility: "Any"
+- model: nvidia/Llama-3.1-8B-Instruct-FP8
+  arch: LlamaForCausalLM
+  config_path: examples/configs/curated/llama-3.1-8b.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
+- model: nvidia/Llama-3.1-8B-Instruct-NVFP4
+  arch: LlamaForCausalLM
+  config_path: examples/configs/curated/llama-3.1-8b.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "B200, GB200"
 - model: nvidia/Llama-3.3-70B-Instruct-FP8
   arch: LlamaForCausalLM
   config_path: examples/configs/curated/llama-3.3-70b.yaml
