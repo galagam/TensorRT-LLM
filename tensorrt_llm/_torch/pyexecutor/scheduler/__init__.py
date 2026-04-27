@@ -36,6 +36,7 @@ from .scheduler import (
     SerializableSchedulerOutput,
     SimpleScheduler,
     SimpleUnifiedScheduler,
+    SpecDecAwareScheduler,
 )
 from .scheduler_v2 import KVCacheV2Scheduler
 
@@ -63,6 +64,7 @@ __all__ = [
     "SerializableSchedulerOutput",
     "SimpleScheduler",
     "SimpleUnifiedScheduler",
+    "SpecDecAwareScheduler",
     # ADP
     "ADPRouter",
     "DefaultADPRouter",

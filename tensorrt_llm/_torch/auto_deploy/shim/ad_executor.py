@@ -65,8 +65,10 @@ from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
     RequestList,
+    RequestScheduler,
     ScheduledRequests,
     SimpleScheduler,
+    SpecDecAwareScheduler,
 )
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
@@ -1288,7 +1290,13 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_num_tokens=engine.cache_seq_interface.info.max_num_tokens,
         ctx_chunk_config=ctx_chunk_config,
     )
-    scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
+    scheduler: RequestScheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
+    # When speculative decoding is active (MTP/Eagle), wrap the scheduler to prevent
+    # mixing prefill and extend batches in the same step.  Mixed batches cause CUDA
+    # graph shape misses and force expensive eager execution; separating them keeps
+    # extend-only batches on the CUDA graph path.
+    if ad_config.speculative_config is not None:
+        scheduler = SpecDecAwareScheduler(scheduler)
 
     vocab_size_padded = engine.cache_seq_interface.info.vocab_size_padded
     sampler = instantiate_sampler(

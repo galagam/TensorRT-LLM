@@ -12,7 +12,7 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
-from ..llm_request import LlmRequest, LlmRequestState
+from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 
 RequestList = list[LlmRequest]
 
@@ -300,6 +300,73 @@ class SimpleScheduler(RequestScheduler):
     def can_schedule(self, requests: RequestList) -> bool:
         fitting_requests, _, _ = self.capacity_scheduler.schedule_request(requests)
         return len(fitting_requests) == len(requests)
+
+
+class SpecDecAwareScheduler(RequestScheduler):
+    """Wraps a RequestScheduler to prevent mixing prefill batches with spec-dec extend batches.
+
+    When generation requests carrying draft tokens (MTP/Eagle extend steps) are present,
+    context (prefill) requests are deferred to the next scheduling cycle.  This keeps
+    the batch shape extend-only so that the CUDA graph compiled for extend-only inputs
+    can replay, avoiding the costly eager-mode fallback for mixed batches.
+
+    Starvation guard: a context request that has been deferred max_defer_steps consecutive
+    times is admitted regardless, bounding the TTFT penalty to at most
+    max_defer_steps × (one extend step latency).
+    """
+
+    def __init__(
+        self,
+        base_scheduler: RequestScheduler,
+        max_defer_steps: int = 4,
+    ):
+        self._base = base_scheduler
+        self._max_defer_steps = max_defer_steps
+        # Maps request_id → consecutive defer count
+        self._defer_counts: dict[int, int] = {}
+
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> SchedulerOutput:
+        output = self._base.schedule_request(active_requests, inflight_request_ids)
+
+        if not output.context_requests:
+            return output
+
+        # Determine whether any generation request carries draft tokens (spec-dec extend step)
+        has_spec_dec_extend = any(get_draft_token_length(r) > 0 for r in output.generation_requests)
+        if not has_spec_dec_extend:
+            for req in output.context_requests:
+                self._defer_counts.pop(req.request_id, None)
+            return output
+
+        # Partition context requests into urgent (starvation-protected) and deferrable
+        urgent: RequestList = []
+        deferrable: RequestList = []
+        for req in output.context_requests:
+            count = self._defer_counts.get(req.request_id, 0)
+            if count >= self._max_defer_steps:
+                urgent.append(req)
+                self._defer_counts.pop(req.request_id, None)
+            else:
+                deferrable.append(req)
+                self._defer_counts[req.request_id] = count + 1
+
+        if not deferrable:
+            # All context requests hit the starvation limit; allow the mixed batch
+            return output
+
+        # Return with only urgent context requests (may be empty → pure extend batch)
+        return SchedulerOutput(
+            urgent,
+            output.generation_requests,
+            output.paused_requests,
+            output.fitting_disagg_gen_init_requests,
+            output.num_fitting_requests,
+        )
+
+    def can_schedule(self, requests: RequestList) -> bool:
+        return self._base.can_schedule(requests)
 
 
 class ChunkingPolicy(Enum):
