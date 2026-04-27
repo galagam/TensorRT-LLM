@@ -36,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decodi
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
+from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import (
@@ -327,6 +328,26 @@ def _generate_dummy_request(
     return dummy_request
 
 
+def _find_eagle_wrapper(model: "torch.nn.Module") -> Optional["torch.nn.Module"]:
+    """Traverse the compiled model stack to find an EagleWrapper instance.
+
+    After compilation, model = CapturedGraph → .model = EagleWrapper.
+    We do a shallow attribute walk rather than named_modules() to avoid
+    traversing into frozen GraphModule subgraphs.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import EagleWrapper
+
+    if isinstance(model, EagleWrapper):
+        return model
+    for attr in ("model", "monolithic"):
+        child = getattr(model, attr, None)
+        if child is not None:
+            result = _find_eagle_wrapper(child)
+            if result is not None:
+                return result
+    return None
+
+
 def maybe_pad_for_cuda_graph(func):
     def wrapper(
         self: "ADEngine",
@@ -379,6 +400,17 @@ def maybe_pad_for_cuda_graph(func):
 
         if cg_batch_size is None:
             return _call_func()
+
+        # Resolve and apply runtime_draft_len from schedule (if configured).
+        # Must happen before padding so dummy requests use the correct draft token count.
+        if self.draft_len_schedule is not None:
+            resolved_dl = get_draft_len_for_batch_size(
+                self.draft_len_schedule, cg_batch_size, self.max_total_draft_tokens
+            )
+            if resolved_dl != self.runtime_draft_len:
+                self.runtime_draft_len = resolved_dl
+                if self._eagle_wrapper is not None:
+                    self._eagle_wrapper.runtime_draft_len = resolved_dl
 
         # let's check if all ranks can pad the batch if they need to
         can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
@@ -535,8 +567,12 @@ class ADEngine(ModelEngine):
         # check for max total draft tokens
         if self.spec_config is not None:
             self.max_total_draft_tokens = self.spec_config.tokens_per_gen_step - 1
+            self.draft_len_schedule = self.spec_config.draft_len_schedule  # None if not set
         else:
             self.max_total_draft_tokens = 0
+            self.draft_len_schedule = None
+        # Mutable: updated per step by maybe_pad_for_cuda_graph when draft_len_schedule is active.
+        self.runtime_draft_len: int = self.max_total_draft_tokens
 
         # For compatibility with PyTorchModelEngine utilities
         self.batch_size = cache_seq_interface.info.max_batch_size
@@ -563,6 +599,10 @@ class ADEngine(ModelEngine):
 
         # keep a reference for one dummy request around
         self.padding_dummy_request: Optional[LlmRequest] = None
+
+        # Direct reference to EagleWrapper (if present) for runtime_draft_len propagation.
+        # Used by maybe_pad_for_cuda_graph to sync runtime_draft_len on eager-mode fallback path.
+        self._eagle_wrapper = _find_eagle_wrapper(self.model)
 
         # Reuse _execute_logit_post_processors from PyTorchModelEngine
         self.dist_config = dist_config
@@ -795,8 +835,12 @@ class ADEngine(ModelEngine):
             # check if need overlap and draft length
             is_overlap = not self._disable_overlap_scheduler and not request.is_dummy
 
-            # check draft length
+            # check draft length, clipping to runtime_draft_len when draft_len_schedule is active.
+            # py_draft_tokens always has max_total_draft_tokens entries (trailing entries are zeros
+            # from prior steps with lower runtime_draft_len); we only use the first runtime_draft_len.
             draft_len = get_draft_token_length(request)
+            if self.draft_len_schedule is not None and draft_len > self.runtime_draft_len:
+                draft_len = self.runtime_draft_len
 
             # there are cases:
             # 1. No overlap: we are preparing for the current iteration --> use previous token count
@@ -816,7 +860,7 @@ class ADEngine(ModelEngine):
                 flat_gather_indices.extend(range(start, start + (1 + draft_len) * stride, stride))
             else:
                 input_ids.append(request.get_token(0, request.get_num_tokens(0) - 1))
-                input_ids.extend([] if draft_len == 0 else request.py_draft_tokens)
+                input_ids.extend([] if draft_len == 0 else request.py_draft_tokens[:draft_len])
 
             cu_seqlen.append(len(input_ids))
             input_pos.append(num_tokens_seen)

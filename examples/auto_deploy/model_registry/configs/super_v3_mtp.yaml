@@ -9,7 +9,7 @@ attn_backend: trtllm
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128]
 kv_cache_config:
   # tunable mamba cache dtype
   # --> use float32 for accuracy and default (auto) for speed
@@ -18,6 +18,15 @@ speculative_config:
   decoding_type: MTP
   num_nextn_predict_layers: 6
   mtp_eagle_one_model: true
+  # draft_len_schedule: reduce draft tokens at high concurrency to keep MTP step time competitive.
+  # Semantics: each key is an upper-bound batch size; value is draft_len for batch sizes UP TO that key.
+  # Key 8 must equal num_nextn_predict_layers (max_draft_len) per config validator.
+  # At conc>=65: MTP is behind no-MTP regardless of draft_len; schedule stops at bs=128.
+  draft_len_schedule:
+    8: 6    # bs  1- 8: 6 drafts (7 tokens/seq) — spec dec dominates at low conc
+    32: 5   # bs  9-32: 5 drafts (6 tokens/seq) — mild reduction
+    64: 3   # bs 33-64: 3 drafts (4 tokens/seq) — step time ~40ms, closer to no-MTP ~12ms
+    128: 2  # bs 65-128: 2 drafts (3 tokens/seq) — step time ~37ms vs no-MTP ~16ms
 transforms:
   detect_sharding:
     allreduce_strategy: NCCL

@@ -749,6 +749,10 @@ class EagleWrapper(nn.Module):
         self.target_model = target_model
         self.draft_model = draft_model
         self.max_draft_len = config.max_draft_len
+        # Mutable at capture time to support draft_len_schedule.  Always <= max_draft_len.
+        # Output tensor shapes are always [*, max_draft_len+1] so CUDA graph output buffers
+        # stay uniform across different runtime_draft_len captures.
+        self.runtime_draft_len: int = config.max_draft_len
         self.load_embedding_from_target = config.load_embedding_from_target
         self.load_lm_head_from_target = config.load_lm_head_from_target
         self.normalize_target_hidden_state = config.normalize_target_hidden_state
@@ -948,7 +952,10 @@ class EagleWrapper(nn.Module):
         # some sanity checks on the batch
         assert num_decode == 0, "decode without drafting is not supported inside the eagle wrapper"
         if num_extend > 0:
-            assert num_extend_tokens // num_extend == 1 + self.max_draft_len, "Unexpected draft len"
+            assert num_extend_tokens // num_extend == 1 + self.runtime_draft_len, (
+                f"Unexpected draft len: expected {1 + self.runtime_draft_len} tokens/seq, "
+                f"got {num_extend_tokens // num_extend}"
+            )
 
         # ---- Phase 1: Target model forward ----
         out = self.target_model(
@@ -991,15 +998,17 @@ class EagleWrapper(nn.Module):
         # includes:
         # 1. idx=0: golden/bonus token for prefill+extend sequences --> guaranteed new token
         # 2. idx>1: target-sampled+accepted/declined tokens from previous draft iteration
-        new_tokens_2d_extend = sampled_tokens[num_prefill:].view(num_extend, 1 + self.max_draft_len)
+        # Shape uses runtime_draft_len (may be < max_draft_len with draft_len_schedule).
+        # new_tokens_2d output always pads to max_draft_len+1 for uniform CUDA graph buffers.
+        new_tokens_2d_extend = sampled_tokens[num_prefill:].view(
+            num_extend, 1 + self.runtime_draft_len
+        )
+        new_tokens_2d = torch.zeros(
+            num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
+        )
         if num_prefill > 0:
-            new_tokens_2d = torch.zeros(
-                num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
-            )
             new_tokens_2d[:num_prefill, 0] = sampled_tokens[:num_prefill]
-            new_tokens_2d[num_prefill:] = new_tokens_2d_extend
-        else:
-            new_tokens_2d = new_tokens_2d_extend
+        new_tokens_2d[num_prefill:, : 1 + self.runtime_draft_len] = new_tokens_2d_extend
 
         # ---- Phase 4: Verify ----
         # get original input ids
@@ -1009,20 +1018,24 @@ class EagleWrapper(nn.Module):
         # - prefill input ids rolled left by 1 with the bonus token at the end
         # - all sampled tokens from the extend requests
         # Either way the total number of tokens is the same as in the target model call just before!
+        # output_ids_target must have exactly total_tokens = num_prefill_tokens +
+        # num_extend * (1 + runtime_draft_len) elements.  Use new_tokens_2d_extend
+        # (shape [num_extend, 1+runtime_draft_len]) for the extend portion, NOT the
+        # zero-padded new_tokens_2d (shape [num_sequences, max_draft_len+1]).
         if num_prefill > 0:
             output_ids_target = input_ids_flat.roll(-1, dims=0)  # [total_tokens]
             lgi_prefill = csi.get_arg("token_gather_indices")[:num_prefill]
             output_ids_target[lgi_prefill] = new_tokens_2d[:num_prefill, 0]
-            output_ids_target[num_prefill_tokens:] = new_tokens_2d[num_prefill:].flatten()
+            output_ids_target[num_prefill_tokens:] = new_tokens_2d_extend.flatten()
         else:
-            output_ids_target = new_tokens_2d.flatten()  # [total_tokens]
+            output_ids_target = new_tokens_2d_extend.flatten()  # [total_tokens]
 
         # build new_tokens_lens
         if num_extend > 0:
             input_ids_extend = input_ids_flat[num_prefill_tokens:].view(num_extend, -1)
             mask_same = new_tokens_2d_extend[:, :-1] == input_ids_extend[:, 1:]
             # + 1 since it's the bonus token this is not counted in the cumprod. Note that
-            # 1 <= new_tokens_lens_extend <= max_draft_len + 1
+            # 1 <= new_tokens_lens_extend <= runtime_draft_len + 1
             new_tokens_lens_extend = mask_same.cumprod(dim=1).sum(dim=1, dtype=torch.int32) + 1
 
         if num_prefill == 0:
@@ -1047,8 +1060,8 @@ class EagleWrapper(nn.Module):
         # maximum draft length. NOTE: cache is currently at the position corresponding to the last
         # draft token. Hence the following constraint is true:
         # c_offset[:num_prefill] == 1
-        # -(max_draft_len-1) <= c_offset <= 1
-        c_offset = new_tokens_lens - self.max_draft_len
+        # -(runtime_draft_len-1) <= c_offset <= 1
+        c_offset = new_tokens_lens - self.runtime_draft_len
         if num_prefill > 0:
             c_offset[:num_prefill].fill_(1)
 
@@ -1080,7 +1093,9 @@ class EagleWrapper(nn.Module):
         next_new_tokens[:, 0] = csi.info.maybe_gather_and_squeeze(csi.get_arg("input_ids"))
 
         # ---- Phase 5: Draft loop ----
-        for draft_idx in range(self.max_draft_len):
+        # Run runtime_draft_len iterations (may be < max_draft_len with draft_len_schedule).
+        # Unwritten columns in next_new_tokens remain zero (output buffer is max_draft_len+1 wide).
+        for draft_idx in range(self.runtime_draft_len):
             # run forward pass on the draft model in shape [num_sequences, 1]
             draft_output = self.draft_model(
                 inputs_embeds=self.apply_draft_embedding(csi.get_arg("input_ids")),
@@ -1106,7 +1121,7 @@ class EagleWrapper(nn.Module):
 
             # switch to generate (if not done already), store new tokens, and offset cache
             # can be skipped for last iteration since after we return metadata will be reset
-            if draft_idx < self.max_draft_len - 1:
+            if draft_idx < self.runtime_draft_len - 1:
                 csi.info.switch_to_generate_()
                 csi.info.copy_("input_ids", draft_tokens)
                 csi.info.offset_pos_and_cache_(c_offset)

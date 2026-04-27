@@ -4,6 +4,8 @@ import torch.nn as nn
 from pydantic import Field, model_validator
 from torch.fx import GraphModule
 
+from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
+
 from ...compile import ArgsKwargs, CompileBackendRegistry
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -106,7 +108,16 @@ class CompileModel(BaseTransform):
 
         def _get_args_kwargs(bs: int) -> ArgsKwargs:
             if spec_config is not None:
-                cm.info.set_capture_batch(batch_size=bs, max_draft_len=spec_config.max_draft_len)
+                # Resolve per-batch-size draft length (draft_len_schedule) or fall back to static max.
+                resolved_dl = get_draft_len_for_batch_size(
+                    spec_config.draft_len_schedule, bs, spec_config.max_draft_len
+                )
+                # Propagate to any EagleWrapper in the model so _forward_with_kv_cache uses
+                # the correct loop bound and tensor shapes during CUDA graph capture.
+                for m in mod.modules():
+                    if hasattr(m, "runtime_draft_len"):
+                        m.runtime_draft_len = resolved_dl
+                cm.info.set_capture_batch(batch_size=bs, max_draft_len=resolved_dl)
                 return (), {**cm.named_args, "cache_seq_interface": cm}
             cm.info.set_capture_batch(batch_size=bs)
             return (), cm.named_args
