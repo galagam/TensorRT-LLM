@@ -3,6 +3,7 @@ import datetime
 import functools
 import gc
 import os
+import queue
 import threading
 import time
 import traceback
@@ -125,6 +126,23 @@ class BatchState:
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
     scheduled_ctx_reqs: list[LlmRequest] = None
+
+
+@dataclasses.dataclass
+class _OverlapForwardWorkItem:
+    scheduled_batch: ScheduledRequests
+    iter_start_time: float
+    iter_stats: IterationStats = None
+    state_ready_event: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+
+
+@dataclasses.dataclass
+class _OverlapForwardResult:
+    batch_state: Optional[BatchState] = None
+    error: Optional[BaseException] = None
+    traceback: str = ""
+    done: bool = False
 
 
 class PyExecutor:
@@ -1008,95 +1026,209 @@ class PyExecutor:
                 )
                 time.sleep(5)
 
+        # Keep one batch running and one batch queued so scheduling can stay
+        # ahead of GPU work without allowing unbounded speculative progress.
+        max_inflight_batches = 2
+        work_queue = queue.Queue(maxsize=max_inflight_batches)
+        result_queue = queue.Queue()
+        forward_worker = threading.Thread(
+            target=self._overlap_forward_worker,
+            args=(work_queue, result_queue),
+            daemon=True)
+        forward_worker.start()
+        inflight_batches = 0
+        sent_stop_to_forward_worker = False
+
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while True:
-                profile_step()
-                if self.enable_iter_perf_stats:
-                    iter_start_time = time.time()
+            try:
+                while True:
+                    while inflight_batches >= max_inflight_batches:
+                        self._handle_overlap_forward_result(
+                            result_queue.get())
+                        inflight_batches -= 1
+                        if (self.kv_cache_transceiver
+                                and self.ctx_in_transmission_requests):
+                            self._terminate_ctx_finished_requests()
 
-                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
-                if scheduled_batch is None:
+                    profile_step()
+                    if self.enable_iter_perf_stats:
+                        iter_start_time = time.time()
+
+                    scheduled_batch, iter_stats = (
+                        self._prepare_and_schedule_batch())
+                    if scheduled_batch is None:
+                        break
+
+                    self._pause_requests(scheduled_batch.paused_requests)
+
+                    if scheduled_batch.batch_size > 0:
+                        self._prepare_overlap_scheduled_batch(scheduled_batch)
+                        work_item = _OverlapForwardWorkItem(
+                            scheduled_batch=scheduled_batch,
+                            iter_start_time=iter_start_time,
+                            iter_stats=iter_stats)
+                        work_queue.put(work_item)
+                        inflight_batches += 1
+
+                        if self._needs_overlap_schedule_sync(
+                                scheduled_batch):
+                            work_item.state_ready_event.wait()
+
+                    if (self.kv_cache_transceiver
+                            and self.ctx_in_transmission_requests):
+                        self._terminate_ctx_finished_requests()
+
+                work_queue.put(None)
+                sent_stop_to_forward_worker = True
+                while True:
+                    result = result_queue.get()
+                    if result.done:
+                        break
+                    self._handle_overlap_forward_result(result)
+                    inflight_batches -= 1
+                    if (self.kv_cache_transceiver
+                            and self.ctx_in_transmission_requests):
+                        self._terminate_ctx_finished_requests()
+            finally:
+                if forward_worker.is_alive():
+                    if not sent_stop_to_forward_worker:
+                        try:
+                            work_queue.put_nowait(None)
+                        except queue.Full:
+                            pass
+                    forward_worker.join(timeout=1)
+
+    def _prepare_overlap_scheduled_batch(self, scheduled_batch):
+        if self.kv_cache_transceiver:
+            # For generation requests which have completed KV cache transfer
+            self._prepare_disagg_gen_transmission_complete(scheduled_batch)
+
+        self.resource_manager.prepare_resources(scheduled_batch)
+
+        # The generation requests that are do not have batch_idx,
+        # needs to be in front of the batch due to the assumptions
+        # made in model_engine.py::_forward_step. This is only important
+        # for disaggregated serving. For non-disaggregated serving,
+        # the generation requests always have batch_idx.
+        scheduled_batch.generation_requests = sorted(  # stable sort
+            scheduled_batch.generation_requests,
+            key=lambda req: int(req.py_batch_idx is not None),
+        )
+
+        if self.kv_cache_transceiver:
+            # Return the first token to the client
+            self._handle_first_token_response(scheduled_batch)
+
+    def _needs_overlap_schedule_sync(self, scheduled_batch):
+        return (bool(scheduled_batch.context_requests)
+                or self.enable_attention_dp)
+
+    def _overlap_forward_worker(self, work_queue, result_queue):
+        torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        previous_batch = None
+        current_work_item = None
+
+        def put_error(error):
+            result_queue.put(
+                _OverlapForwardResult(error=error,
+                                      traceback=traceback.format_exc()))
+
+        try:
+            while True:
+                current_work_item = work_queue.get()
+                if current_work_item is None:
                     break
 
-                self._pause_requests(scheduled_batch.paused_requests)
+                try:
+                    current_batch = self._execute_overlap_forward_work_item(
+                        current_work_item, previous_batch)
+                    current_work_item.state_ready_event.set()
 
-                if scheduled_batch.batch_size > 0:
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
+                    if previous_batch is not None:
+                        self._process_batch_state(previous_batch)
+                        result_queue.put(
+                            _OverlapForwardResult(
+                                batch_state=previous_batch))
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    previous_batch = current_batch
+                except BaseException as e:
+                    current_work_item.state_ready_event.set()
+                    put_error(e)
+                    return
 
-                    # The generation requests that are do not have batch_idx,
-                    # needs to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+            if previous_batch is not None:
+                self._update_requests(previous_batch.sample_state)
+                self._process_batch_state(previous_batch)
+                result_queue.put(
+                    _OverlapForwardResult(batch_state=previous_batch))
+            result_queue.put(_OverlapForwardResult(done=True))
+        except BaseException as e:
+            if current_work_item is not None:
+                current_work_item.state_ready_event.set()
+            put_error(e)
 
-                    if self.kv_cache_transceiver:
-                        # Return the first token to the client
-                        self._handle_first_token_response(scheduled_batch)
+    def _execute_overlap_forward_work_item(
+            self, work_item: _OverlapForwardWorkItem,
+            previous_batch: Optional[BatchState]) -> BatchState:
+        scheduled_batch = work_item.scheduled_batch
+        previous_tensors_device = (
+            previous_batch and previous_batch.sample_state
+            and previous_batch.sample_state.device)
 
-                    previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
+        batch_outputs = self._forward_step(scheduled_batch,
+                                           previous_tensors_device)
 
-                    batch_outputs = self._forward_step(scheduled_batch,
-                                                       previous_tensors_device)
+        if previous_batch is not None:
+            self._update_requests(previous_batch.sample_state)
 
-                    if self.previous_batch is not None:
-                        self._update_requests(self.previous_batch.sample_state)
+        self._execute_guided_decoder(scheduled_batch, batch_outputs['logits'])
 
-                    self._execute_guided_decoder(scheduled_batch,
-                                                 batch_outputs['logits'])
+        sample_state = self._sample_async(scheduled_batch, batch_outputs)
+        assert sample_state is not None, "Sampling failed"
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
-                    assert sample_state is not None, "Sampling failed"
+        self._update_request_states(scheduled_batch)
 
-                    self._update_request_states(scheduled_batch)
+        ctx_transmission_reqs = self._send_disagg_ctx_cache(
+            scheduled_batch.context_requests
+        ) if self.kv_cache_transceiver else []
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
+        if self.enable_iter_perf_stats:
+            work_item.iter_stats.inflight_batching_stats.num_ctx_tokens = (
+                self.model_engine.iter_states['num_ctx_tokens'])
 
-                    if self.previous_batch is not None:
-                        self._process_previous_batch()
-                        self.previous_batch: Optional[BatchState] = None
+        return BatchState(sample_state=sample_state,
+                          iter_start_time=work_item.iter_start_time,
+                          iter_stats=work_item.iter_stats,
+                          ctx_transmission_reqs=ctx_transmission_reqs)
 
-                    if self.enable_iter_perf_stats:
-                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                            'num_ctx_tokens']
-
-                    self.previous_batch = BatchState(
-                        sample_state=sample_state,
-                        iter_start_time=iter_start_time,
-                        iter_stats=iter_stats,
-                        ctx_transmission_reqs=ctx_transmission_reqs)
-
-                if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
+    def _handle_overlap_forward_result(self,
+                                       result: _OverlapForwardResult) -> None:
+        if result.error is not None:
+            logger.error(result.traceback)
+            raise result.error
 
     def _process_previous_batch(self):
-        if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
-            for req in self.previous_batch.ctx_transmission_reqs:
+        self._process_batch_state(self.previous_batch)
+
+    def _process_batch_state(self, batch_state: BatchState):
+        if self.kv_cache_transceiver and batch_state.ctx_transmission_reqs:
+            for req in batch_state.ctx_transmission_reqs:
                 req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
+        scheduled_requests = batch_state.sample_state.scheduled_requests
         self.resource_manager.update_resources(scheduled_requests)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
-                                     self.previous_batch)
+                                     batch_state)
 
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
