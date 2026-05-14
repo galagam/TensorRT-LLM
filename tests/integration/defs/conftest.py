@@ -1824,6 +1824,22 @@ def skip_by_device_count(request):
 
 
 @pytest.fixture(autouse=True)
+def skip_by_world_size_device_count(request):
+    "fixture for skipping parameterized world_size cases that exceed device count"
+    callspec = getattr(request.node, "callspec", None)
+    if callspec is None or "world_size" not in callspec.params:
+        return
+
+    world_size = callspec.params["world_size"]
+    if not isinstance(world_size, int):
+        return
+
+    device_count = get_device_count()
+    if world_size > int(device_count):
+        pytest.skip(f'Device count {device_count} is less than {world_size}')
+
+
+@pytest.fixture(autouse=True)
 def skip_by_mpi_world_size(request):
     "fixture for skip less mpi world size"
     if request.node.get_closest_marker('skip_less_mpi_world_size'):
