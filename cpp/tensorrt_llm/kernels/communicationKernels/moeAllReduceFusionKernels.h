@@ -15,16 +15,19 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
-namespace tensorrt_llm::kernels::ar_fusion::moe
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion::moe
 {
 static constexpr int kElemsPerAccess = 8;
 static constexpr int kOneShotMaxToken = 128;
@@ -55,7 +58,7 @@ struct AllReduceFusionParams
     void* rms_gamma;
     float rms_eps;
     float* scale_factor;
-    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
+    QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
 };
 
@@ -102,4 +105,6 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
 
 void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params);
 
-} // namespace tensorrt_llm::kernels::ar_fusion::moe
+} // namespace kernels::ar_fusion::moe
+
+TRTLLM_NAMESPACE_END

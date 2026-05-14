@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import datetime
 import gc
 import json
 import os
 import sys
+import time
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
@@ -16,7 +18,6 @@ os.environ['TRTLLM_FORCE_XQA'] = '1'
 
 import random
 import shutil
-import sys
 import tempfile
 from typing import List, Optional, Union
 
@@ -28,10 +29,12 @@ import transformers
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
+from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
+                                   GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
-                                 KvCacheConfig, KvCacheRetentionConfig,
+                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                                 KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
@@ -42,7 +45,7 @@ from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
@@ -55,7 +58,8 @@ from llmapi.lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request)
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
+from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu, altered_env
+
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
@@ -198,7 +202,7 @@ def test_llm_build_config():
         # read the build_config and check if the parameters are correctly saved
         engine_config = json.load(f)
 
-        build_config1 = BuildConfig.from_dict(engine_config["build_config"])
+        build_config1 = BuildConfig(**engine_config["build_config"])
 
         # Know issue: this will be converted to None after save engine for single-gpu
         build_config1.plugin_config.nccl_plugin = 'float16'
@@ -215,18 +219,18 @@ def test_llm_args_invalid_usage():
     runtime_max_num_tokens = 2
 
     # Update build_config with warning msg if runtime arguments are passed.
-    llm_args = LlmArgs.from_kwargs(model='test-model',
-                                   max_batch_size=runtime_max_batch_size,
-                                   max_num_tokens=runtime_max_num_tokens)
+    llm_args = LlmArgs(model='test-model',
+                       max_batch_size=runtime_max_batch_size,
+                       max_num_tokens=runtime_max_num_tokens)
     assert llm_args.build_config.max_batch_size == runtime_max_batch_size
     assert llm_args.build_config.max_num_tokens == runtime_max_num_tokens
 
     # Conflict between build_config and runtime_params
     build_config = BuildConfig(max_batch_size=5, max_num_tokens=7)
-    llm_args = LlmArgs.from_kwargs(model='test-model',
-                                   build_config=build_config,
-                                   max_batch_size=runtime_max_batch_size,
-                                   max_num_tokens=runtime_max_num_tokens)
+    llm_args = LlmArgs(model='test-model',
+                       build_config=build_config,
+                       max_batch_size=runtime_max_batch_size,
+                       max_num_tokens=runtime_max_num_tokens)
     assert llm_args.build_config.max_batch_size == build_config.max_batch_size
     assert llm_args.build_config.max_num_tokens == build_config.max_num_tokens
 
@@ -316,7 +320,7 @@ class MyTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, **kwargs)
+        return self.tokenizer(texts, **kwargs)
 
 
 @pytest.mark.part0
@@ -357,7 +361,7 @@ def test_llm_with_kv_cache_retention_config():
     kv_cache_retention_config = KvCacheRetentionConfig([
         KvCacheRetentionConfig.TokenRangeRetentionConfig(
             0, 2, 30, datetime.timedelta(seconds=30))
-    ], 80)
+    ], 80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
@@ -455,21 +459,12 @@ def test_llm_generate_async():
 
 def _test_llm_generate_async(model_name=default_model_name,
                              tp_size: int = 1,
-                             use_auto_parallel: bool = False,
                              tokenizer=None):
-    if "Mixtral" in model_name and use_auto_parallel:
-        pytest.skip("Auto parallel is not supported for Mixtral models")
-
-    tp_size = tp_size if not use_auto_parallel else 1
-    world_size = tp_size if use_auto_parallel else None
-
     llm = LLM(
         model=get_model_path(model_name),
         tokenizer=tokenizer,
         kv_cache_config=global_kvcache_config,
         tensor_parallel_size=tp_size,
-        auto_parallel=use_auto_parallel,
-        auto_parallel_world_size=world_size,
         fast_build=True,
     )
 
@@ -549,6 +544,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
+@pytest.mark.mpi_ray_parity
 def test_llm_generate_async_with_stream_interval(chunked):
     model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
     max_num_tokens = 256
@@ -706,6 +702,56 @@ def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     outputs = [output.result() for output in outputs]
     print(outputs)
     check_output(outputs, references)
+
+
+@force_ampere
+@pytest.mark.part0
+def test_generate_with_cuda_graph_dynamic_beam_width():
+    build_config = BuildConfig(max_beam_width=3)
+    extended_runtime_perf_knob_config = ExtendedRuntimePerfKnobConfig(
+        cuda_graph_mode=True, cuda_graph_cache_size=64)
+
+    llm = LLM(
+        model=llama_model_path,
+        build_config=build_config,
+        kv_cache_config=global_kvcache_config,
+        extended_runtime_perf_knob_config=extended_runtime_perf_knob_config,
+        fast_build=True,
+    )
+
+    def _generate(beam_width):
+        sampling_params = SamplingParams(
+            max_tokens=8,
+            n=beam_width,
+            use_beam_search=(beam_width > 1),
+        )
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
+        # Snapshot per-prompt, per-beam token IDs as a hashable structure
+        # so we can compare bit-for-bit across runs.
+        return [
+            tuple(tuple(o.token_ids) for o in out.outputs) for out in outputs
+        ]
+
+    try:
+        # Capture clean references. The first time each beam width is
+        # used, a fresh graph is captured against the *current* buffers,
+        # so these outputs are correct regardless of the bug.
+        ref = {1: _generate(1), 2: _generate(2), 3: _generate(3)}
+
+        # Now cycle through the beam widths again. Each transition fires
+        # changeBeamWidth(), reallocating decoder state.
+        revisit_sequence = [1, 2, 3, 1, 3, 2, 1]
+        for beam_width in revisit_sequence:
+            got = _generate(beam_width)
+            assert got == ref[beam_width], (
+                f"beam_width={beam_width}: token IDs diverged from the "
+                f"reference run after intervening beam-width changes. "
+                f"This indicates that a stale cudaGraphExec_t was "
+                f"replayed against reallocated decoder state.\n"
+                f"reference: {ref[beam_width]}\n"
+                f"got:       {got}")
+    finally:
+        llm.shutdown()
 
 
 @pytest.mark.skip(reason="https://nvbugs/5435714")
@@ -1224,7 +1270,7 @@ def test_llm_api_medusa():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-            speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
+            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1263,7 +1309,7 @@ def test_llm_api_medusa_tp2():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-              speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
+              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1301,7 +1347,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -1348,7 +1394,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,
@@ -1459,20 +1505,7 @@ def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
         assert similar(output.outputs[0].text, ref)
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
-    [
-        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
-        # llm.generate call, that's repeated twice.
-        ([
-            2,
-        ], 1, 2, 2, 3),
-        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
-        # cache size < LoRA CPU cache size
-        ([2, 2, 2], 1, 3, 1, 1),
-    ])
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_load_new_adapters(
+def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
@@ -1491,6 +1524,43 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         enable_lora=True,
         build_config=build_config,
         fast_build=True)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+    """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+    llm.generate call, that's repeated twice.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2],
+        max_loras=1,
+        max_cpu_loras=2,
+        repeat_calls=2,
+        repeats_per_call=3)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+    """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+    cache size < LoRA CPU cache size.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2, 2, 2],
+        max_loras=1,
+        max_cpu_loras=3,
+        repeat_calls=1,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_read_from_cache_after_insert():
+    """Test that loading and then using the same adapters loaded in cache works."""
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=3,
+        max_cpu_loras=3,
+        repeat_calls=2,
+        repeats_per_call=1)
 
 
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():
@@ -1779,15 +1849,22 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      backend=None):
     LLM_CLASS = LLM
     llm_args_extra = {}
+    kv_cache_args_extra = {}
     if backend in ["pytorch", "autodeploy"]:
         LLM_CLASS = LLM_torch
+        if streaming:
+            # need this so that context_logits / prompt_logprobs are not dropped
+            # in the 2nd reuse of llm.generate() in streaming mode
+            kv_cache_args_extra["enable_block_reuse"] = False
     else:
+        build_config = BuildConfig(gather_context_logits=True)
         llm_args_extra["fast_build"] = True
+        llm_args_extra["build_config"] = build_config
 
     llm = LLM_CLASS(
         llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        build_config=BuildConfig(gather_context_logits=True),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                      **kv_cache_args_extra),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
         **llm_args_extra,
@@ -1830,6 +1907,18 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                 logprobs_result[0].keys()) in {logprobs, logprobs + 1}
             # Most contain log prob of the sample token, even if it's not within K
             assert token_ids[0] in logprobs_result[0].keys()
+            for step_logprobs in logprobs_result:
+                assert len(step_logprobs) == logprobs
+                logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
+                                 for logprob_obj in step_logprobs.values()]
+                sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+
+                for i in range(logprobs - 1):
+                    current_logprob, current_rank = sorted_by_rank[i]
+                    next_logprob, next_rank = sorted_by_rank[i + 1]
+                    assert current_logprob >= next_logprob
+                    assert current_rank == i + 1
+                    assert next_rank == current_rank + 1
             print("logprobs[0]: ", logprobs_result[0])
 
     if streaming:
@@ -1839,7 +1928,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
             async for output in llm.generate_async(prompt,
                                                    sampling_params,
                                                    streaming=True):
-                logprobs_result_streaming += output.outputs[0].logprobs
+                logprobs_result_streaming += output.outputs[0].logprobs_diff
 
             # comparing streaming logprobs result to non-streaming
             assert logprobs_result_streaming == logprobs_result
@@ -1854,15 +1943,24 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
 
 @force_ampere
 @pytest.mark.parametrize(
-    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
-    [(2, None, True, False), (None, 2, False, False)])
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
+    [
+        # TRT backend test cases
+        (2, None, True, False, "trt"),  # prompt_logprobs with context_logits
+        (None, 2, False, False, "trt"),  # generation logprobs only (top-2)
+        (2, None, False, False,
+         "trt"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "trt"),  # no logprobs at all
+    ])
 def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                              logprobs: Optional[int],
                              return_context_logits: bool,
-                             return_generation_logits: bool):
-    llm_return_logprobs_test_harness(prompt_logprobs, logprobs,
+                             return_generation_logits: bool, backend: str):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
                                      return_context_logits,
-                                     return_generation_logits)
+                                     return_generation_logits,
+                                     backend=backend)
 
 
 @force_ampere
@@ -1880,27 +1978,37 @@ class DummyExecutorWorker3(GenerationExecutorWorker):
         self.failed_requests = set()
 
     def _engine_response_callback(self, response: tllm.Response):
-        if response.client_id in self.failed_requests:
+        client_id = response.client_id
+        if client_id in self.failed_requests:
             return response
         # Making the first response failed, and the subsequent responses successful
         if DummyExecutorWorker3.should_raise_error:
             DummyExecutorWorker3.should_raise_error = False
-            print(f"Raise error for {response.client_id}")
-            self.failed_requests.add(response.client_id)
+            print(f"Raise error for {client_id}")
+            self.failed_requests.add(client_id)
+            if not response.result.is_final:
+                self.abort_request(client_id)
             return tllm.Response(
-                request_id=0,  # dummy value
-                client_id=response.client_id,
+                request_id=self._client_id_to_request_id[client_id],
+                client_id=client_id,
                 error_msg="Test error")
         else:
             return response
+
+    def _pop_result(self, client_id: int):
+        # The actual worker didn't error, so it may continue generating result,
+        # until the abort message reached it.
+        # So we avoid removing the result queue.
+        if client_id in self.failed_requests:
+            return
+        super()._pop_result(client_id)
 
 
 DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
                                    worker_cls=DummyExecutorWorker3)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error():
+def test_llm_handling_per_request_error():
     llm = LLM(
         model=llama_model_path,
         executor_cls=DummyExecutor3,
@@ -1923,8 +2031,7 @@ def test_llm_handling_per_requeust_error():
     batch_task()
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error_async():
+def test_llm_handling_per_request_error_async():
     llm = LLM(
         model=llama_model_path,
         executor_cls=DummyExecutor3,
@@ -1953,39 +2060,117 @@ def test_llm_handling_per_requeust_error_async():
     asyncio.run(task())
 
 
-def validate_stats(results,
-                   pytorch_backend,
-                   max_tokens,
-                   enable_iter_req_stats=False):
+class DummyExecutorWorker4(GenerationExecutorWorker):
+    should_raise_error = True
+
+    def submit(self, request: GenerationRequest) -> GenerationResult:
+        # Making the first response failed, and the subsequent responses successful
+        if DummyExecutorWorker4.should_raise_error:
+            DummyExecutorWorker4.should_raise_error = False
+            raise RequestError("Test error")
+
+        return super().submit(request)
+
+
+DummyExecutor4 = DummyExecutorMeta("DummyExecutor4", (), {},
+                                   worker_cls=DummyExecutorWorker4)
+
+
+def test_llm_handling_per_request_submit_error():
+    llm = LLM(
+        model=llama_model_path,
+        executor_cls=DummyExecutor4,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+    # The dummy executor will delay the responses
+    sampling_params = SamplingParams(max_tokens=6)
+
+    def batch_task():
+        DummyExecutorWorker4.should_raise_error = True
+        with pytest.raises(RequestError):
+            for output in llm.generate(prompts,
+                                       sampling_params=sampling_params):
+                print(output)
+
+        for output in llm.generate(prompts, sampling_params=sampling_params):
+            print(output)
+
+    batch_task()
+
+
+def validate_stats(
+    *,
+    results,
+    pytorch_backend,
+    max_tokens,
+    pp_size=1,
+    use_overlap=False,
+    enable_chunked_prefill=False,
+    enable_iter_req_stats=False,
+):
     assert results
-    assert len(results) == max_tokens if pytorch_backend else max_tokens + 1
     for iter, result in enumerate(results):
         ifbStats = result["inflightBatchingStats"]
-        expected_num_scheduled = 1 if (iter < max_tokens) else 0
-        assert ifbStats["numScheduledRequests"] == expected_num_scheduled
-        if iter == 0:
-            assert ifbStats["numContextRequests"] == 1
-            assert ifbStats["numGenRequests"] == 0
-            assert result["numActiveRequests"] == 1
-        elif iter == max_tokens:
-            assert ifbStats["numContextRequests"] == 0
-            assert ifbStats["numGenRequests"] == 0
-            assert result["numActiveRequests"] == 0
-        else:
-            assert ifbStats["numContextRequests"] == 0
-            assert ifbStats["numGenRequests"] == 1
-            assert result["numActiveRequests"] == 1
+        print(f"iter: {iter}, ifbStats: {ifbStats}")
+
+    # Filter out the results where no requests are scheduled
+    results = [
+        r for r in results
+        if r["inflightBatchingStats"]["numScheduledRequests"] > 0
+    ]
+
+    context_iterations = 2 if enable_chunked_prefill else 1
+    generation_iterations = max_tokens - 1
+    assert len(results) == context_iterations + generation_iterations
+
+    microbatch_id = 0
+    for iter, result in enumerate(results):
+        ifbStats = result["inflightBatchingStats"]
+
+        if iter < context_iterations:
+            assert ifbStats["numScheduledRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["numContextRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+            assert result["numActiveRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["microBatchId"] == microbatch_id, f"iter: {iter}"
+        elif iter < (context_iterations + generation_iterations):
+            assert ifbStats["numScheduledRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
+            assert ifbStats["numGenRequests"] == 1, f"iter: {iter}"
+            assert result["numActiveRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["microBatchId"] == microbatch_id, f"iter: {iter}"
+
+        # In pipeline parallel mode, increment microbatch_id for each context iteration except the last one,
+        # since the context chunks can be scheduled in each iteration.
+        if pp_size > 1 and iter < context_iterations - 1:
+            microbatch_id += 1
 
         if enable_iter_req_stats:
-            assert "requestStats" in result
+            assert "requestStats" in result, f"iter: {iter}"
             req_stats = result["requestStats"]
-            assert len(req_stats) == 1
+            assert len(req_stats) == 1, f"iter: {iter}"
             req_stat = req_stats[0]
-            assert req_stat["numGeneratedTokens"] == iter + 1
-            assert req_stat["scheduled"] == True
-            assert req_stat[
-                "stage"] == "GENERATION_IN_PROGRESS" if iter + 1 < max_tokens else "GENERATION_COMPLETE"
-            assert req_stat["contextPrefillPosition"] == 4
+            if iter < (context_iterations - 1):
+                # If use_overlap, the stats are one iteration ahead
+                assert req_stat[
+                    "stage"] == "GENERATION_IN_PROGRESS" if use_overlap else "CONTEXT_IN_PROGRESS", f"iter: {iter}"
+                assert req_stat[
+                    "contextPrefillPosition"] == 54 if use_overlap else 32, f"iter: {iter}"
+                assert req_stat["numGeneratedTokens"] == 0, f"iter: {iter}"
+            elif iter < (context_iterations - 1 + generation_iterations):
+                assert req_stat[
+                    "stage"] == "GENERATION_IN_PROGRESS", f"iter: {iter}"
+                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat["numGeneratedTokens"] == iter - (
+                    context_iterations - 1) + 1, f"iter: {iter}"
+            else:
+                assert req_stat[
+                    "stage"] == "GENERATION_COMPLETE", f"iter: {iter}"
+                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "numGeneratedTokens"] == max_tokens, f"iter: {iter}"
+            assert req_stat["scheduled"] == True, f"iter: {iter}"
 
         expected_num_completed = 1 if iter == len(results) - 1 else 0
 
@@ -1993,11 +2178,52 @@ def validate_stats(results,
         if pytorch_backend:
             assert result["numCompletedRequests"] == expected_num_completed
 
+            # Per-iteration request-aggregate fields populated by
+            # PyExecutor._update_iter_stats inside inflightBatchingStats.
+            # Assert presence (a missing key indicates a serializer or
+            # RPC-path regression) and sane per-iteration values (a
+            # zero-under-load value indicates a mis-wired populate block).
+            new_aggregate_keys = (
+                "numCtxKvTokens",
+                "numGenKvTokens",
+                "numQueuedContextRequests",
+                "numQueuedCtxTokens",
+                "numQueuedGenRequests",
+                "numQueuedGenKvTokens",
+                "numPausedKvTokens",
+            )
+            for k in new_aggregate_keys:
+                assert k in ifbStats, f"iter {iter}: missing ifbStats key {k}"
+                assert isinstance(
+                    ifbStats[k],
+                    int), (f"iter {iter}: ifbStats key {k} not int "
+                           f"(got {type(ifbStats[k])})")
+                assert ifbStats[
+                    k] >= 0, f"iter {iter}: ifbStats key {k} negative"
+
+            if iter < context_iterations:
+                # Prefill iteration: at least one scheduled context request
+                # and nonzero numCtxTokens. numCtxTokens is sourced from
+                # model_engine.iter_states after _forward_step for this
+                # batch, so it is overlap-safe under every scheduler
+                # configuration.
+                assert ifbStats["numContextRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+                assert ifbStats["numCtxTokens"] > 0, f"iter: {iter}"
+            else:
+                # Generation iteration: at least one decode request with
+                # nonzero total KV context length.
+                assert ifbStats["numGenRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenKvTokens"] > 0, f"iter: {iter}"
+                assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
+
 
 def llm_get_stats_test_harness(tp_size: int = 1,
+                               pp_size: int = 1,
                                return_context_logits: bool = False,
                                pytorch_backend: bool = False,
                                use_overlap: bool = False,
+                               enable_chunked_prefill: bool = False,
                                enable_iter_req_stats: bool = False):
 
     if return_context_logits and pytorch_backend:
@@ -2011,6 +2237,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     print("return_context_logits: ", return_context_logits)
     print("pytorch_backend: ", pytorch_backend)
     print("use_overlap: ", use_overlap)
+    print("enable_chunked_prefill: ", enable_chunked_prefill)
     print("enable_iter_req_stats: ", enable_iter_req_stats)
     print("-------------")
 
@@ -2021,6 +2248,10 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         llm_args_extra["gather_generation_logits"] = True
         sampling_args_extra["return_context_logits"] = True
 
+    if enable_chunked_prefill:
+        llm_args_extra["enable_chunked_prefill"] = True
+        llm_args_extra["max_num_tokens"] = 32
+
     if pytorch_backend:
         llm_args_extra.update(
             dict(enable_iter_perf_stats=True,
@@ -2028,32 +2259,48 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                  disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
+        llm_args_extra["fast_build"] = True
         LLM_CLASS = LLM
 
-    if not pytorch_backend:
-        llm_args_extra["fast_build"] = True
+    # Since we need to check pp's internal states, we disable the async broadcast
+    # to get a deterministic behavior.
+    env_ctx = altered_env(TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE="0") \
+        if pp_size > 1 else contextlib.nullcontext()
 
-    llm = LLM_CLASS(model=llama_model_path,
-                    kv_cache_config=global_kvcache_config,
-                    tensor_parallel_size=tp_size,
-                    **llm_args_extra)
+    with env_ctx, LLM_CLASS(model=llama_model_path,
+                            kv_cache_config=global_kvcache_config,
+                            tensor_parallel_size=tp_size,
+                            pipeline_parallel_size=pp_size,
+                            **llm_args_extra) as llm:
 
-    max_tokens = 5
-    sampling_params = SamplingParams(max_tokens=max_tokens,
-                                     **sampling_args_extra)
+        max_tokens = 5
+        sampling_params = SamplingParams(max_tokens=max_tokens,
+                                         **sampling_args_extra)
 
-    for output in llm.generate(prompts, sampling_params=sampling_params):
-        print(output)
+        long_prompts = [
+            "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
+        ]
 
-    results = llm.get_stats(2)
+        for output in llm.generate(long_prompts,
+                                   sampling_params=sampling_params):
+            print(output)
 
-    validate_stats(results, pytorch_backend, max_tokens, enable_iter_req_stats)
+        time.sleep(2)
+        results = llm.get_stats(2)
 
-    assert not llm.get_stats(2)
+        validate_stats(results=results,
+                       pp_size=pp_size,
+                       pytorch_backend=pytorch_backend,
+                       max_tokens=max_tokens,
+                       use_overlap=use_overlap,
+                       enable_chunked_prefill=enable_chunked_prefill,
+                       enable_iter_req_stats=enable_iter_req_stats)
 
-    # test that IterationResult()._done is properly set
-    _ = llm.generate(prompts, sampling_params=sampling_params)
-    assert llm.get_stats(2)
+        assert not llm.get_stats(0.5)
+
+        # test that IterationResult()._done is properly set
+        _ = llm.generate(prompts, sampling_params=sampling_params)
+        assert llm.get_stats(2)
 
 
 @pytest.mark.parametrize("return_context_logits", [True, False])
@@ -2121,9 +2368,11 @@ def test_llm_get_queued_stats():
 
 
 def llm_get_stats_async_test_harness(tp_size: int = 1,
+                                     pp_size: int = 1,
                                      return_context_logits: bool = False,
                                      pytorch_backend: bool = False,
                                      use_overlap: bool = False,
+                                     enable_chunked_prefill: bool = False,
                                      enable_iter_req_stats: bool = False):
 
     if return_context_logits and pytorch_backend:
@@ -2137,6 +2386,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     print("return_context_logits: ", return_context_logits)
     print("pytorch_backend: ", pytorch_backend)
     print("use_overlap: ", use_overlap)
+    print("enable_chunked_prefill: ", enable_chunked_prefill)
     print("enable_iter_req_stats: ", enable_iter_req_stats)
     print("-------------")
 
@@ -2145,6 +2395,10 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     if return_context_logits:
         llm_args_extra["build_config"] = BuildConfig(gather_context_logits=True)
         sampling_args_extra["return_context_logits"] = True
+
+    if enable_chunked_prefill:
+        llm_args_extra["enable_chunked_prefill"] = True
+        llm_args_extra["max_num_tokens"] = 32
 
     if pytorch_backend:
         llm_args_extra.update(
@@ -2156,38 +2410,53 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         LLM_CLASS = LLM
         llm_args_extra["fast_build"] = True
 
-    llm = LLM_CLASS(model=llama_model_path,
-                    kv_cache_config=global_kvcache_config,
-                    tensor_parallel_size=tp_size,
-                    **llm_args_extra)
+    with LLM_CLASS(model=llama_model_path,
+                   kv_cache_config=global_kvcache_config,
+                   tensor_parallel_size=tp_size,
+                   pipeline_parallel_size=pp_size,
+                   **llm_args_extra) as llm:
 
-    max_tokens = 6
-    sampling_params = SamplingParams(max_tokens=max_tokens,
-                                     **sampling_args_extra)
+        max_tokens = 6
+        sampling_params = SamplingParams(max_tokens=max_tokens,
+                                         **sampling_args_extra)
 
-    async def task0():
-        async for output in llm.generate_async(prompts[0],
-                                               streaming=True,
-                                               sampling_params=sampling_params):
-            print(output)
+        long_prompts = [
+            "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
+        ]
 
-    async def task1():
-        results = []
-        await asyncio.sleep(
-            3)  # ensure there's stats to collect for the assertion
-        async for stats in llm.get_stats_async(timeout=2):
-            results.append(stats)
+        async def task0():
+            async for output in llm.generate_async(
+                    long_prompts[0],
+                    streaming=True,
+                    sampling_params=sampling_params):
+                print(output)
 
-        assert results
-        if not use_overlap:
-            validate_stats(results, pytorch_backend, max_tokens,
-                           enable_iter_req_stats)
+        async def task1(repetition_index: int):
+            results = []
+            await asyncio.sleep(
+                4)  # ensure there's stats to collect for the assertion
+            async for stats in llm.get_stats_async(
+                    10):  # it will return immediately
+                results.append(stats)
 
-    async def main():
-        for i in range(2):  # test recurrent usage
-            await asyncio.gather(task0(), task1())
+            assert results
+            if not use_overlap:
+                validate_stats(
+                    results=results,
+                    pp_size=pp_size,
+                    pytorch_backend=pytorch_backend,
+                    max_tokens=max_tokens,
+                    use_overlap=use_overlap,
+                    # After the first repetition, context will be reused and there will be no chunking.
+                    enable_chunked_prefill=enable_chunked_prefill
+                    if repetition_index == 0 else False,
+                    enable_iter_req_stats=enable_iter_req_stats)
 
-    asyncio.run(main())
+        async def main():
+            for repetition_index in range(2):  # test recurrent usage
+                await asyncio.gather(task0(), task1(repetition_index))
+
+        asyncio.run(main())
 
 
 @pytest.mark.parametrize("return_context_logits", [True, False])
@@ -2216,7 +2485,8 @@ def test_llm_chunked_prefill():
                   enable_chunked_prefill=False,
                   fast_build=True)
 
-        with pytest.raises(ValueError):
+        # max_num_tokens validation now raises RequestError consistently
+        with pytest.raises(RequestError):
             output = llm.generate_async(
                 "A " * build_config.max_num_tokens,
                 sampling_params=sampling_params,
@@ -2259,13 +2529,9 @@ def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-    if pytorch_backend:
-        # pytorch backend will raise ValueError for max_num_tokens
-        with pytest.raises(ValueError):
-            llm.generate(prompt)
-    else:
-        with pytest.raises(RequestError):
-            llm.generate(prompt)
+    # Both backends now consistently raise RequestError for max_num_tokens validation
+    with pytest.raises(RequestError):
+        llm.generate(prompt)
 
 
 def test_llm_capture_request_error():

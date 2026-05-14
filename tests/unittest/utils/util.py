@@ -1,23 +1,47 @@
-import multiprocessing
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import contextlib
+import faulthandler
+import math
 import os
-import sys
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from difflib import SequenceMatcher
-from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Callable, Generator, Mapping, Tuple
+from typing import Any, Callable, ContextManager, Generator, Protocol
 
+import psutil
 import pynvml
 import pytest
 import tensorrt as trt
 import torch
-from cuda import cuda, nvrtc
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
+except ImportError:
+    from cuda import cuda, nvrtc
+
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
+from tensorrt_llm._torch.hostfunc import hostfunc
+from tensorrt_llm._utils import (mpi_disabled, torch_dtype_to_trt,
+                                 trt_dtype_to_torch)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -72,17 +96,25 @@ def getCUDAVersion():
         print(f"Error getting CUDA version: {e}")
 
 
+def isSM100Family():
+    sm = getSMVersion()
+    return sm == 100 or sm == 103
+
+
 skip_pre_ada = pytest.mark.skipif(
     getSMVersion() < 89,
     reason="This test is not supported in pre-Ada architecture")
 skip_pre_hopper = pytest.mark.skipif(
     getSMVersion() < 90,
     reason="This test is not supported in pre-Hopper architecture")
+skip_no_hopper = pytest.mark.skipif(
+    getSMVersion() != 90,
+    reason="This test is only supported in Hopper architecture")
 skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 skip_blackwell = pytest.mark.skipif(
-    getSMVersion() == 100,
+    getSMVersion() == 100 or getSMVersion() == 103,
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")
@@ -125,11 +157,10 @@ def skip_fp8_pre_ada(use_fp8):
 
 
 def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
-    if getSMVersion() == 100 and (head_size not in [32, 64, 128]
-                                  and context_fmha_type
-                                  != ContextFMHAType.disabled):
+    if (isSM100Family()) and (head_size not in [32, 64, 80, 128] and
+                              context_fmha_type != ContextFMHAType.disabled):
         pytest.skip(
-            "Context FMHA only supports head sizes [32, 64, 128] currently on blackwell."
+            "Context FMHA only supports head sizes [32, 64, 80, 128] currently on blackwell."
         )
 
 
@@ -179,14 +210,14 @@ def skip_gpu_memory_less_than(required_memory: int):
     )
 
 
-skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1024 * 1024 *
-                                                            1024)
+skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1000 * 1000 *
+                                                            1000)
 
 
 def modelopt_installed():
@@ -361,6 +392,23 @@ def run_session(session: Session,
     return outputs
 
 
+@contextlib.contextmanager
+def altered_env(**kwargs):
+    old = {}
+    for k, v in kwargs.items():
+        if k in os.environ:
+            old[k] = os.environ[k]
+        os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k in kwargs:
+            if k not in old:
+                os.environ.pop(k)
+            else:
+                os.environ[k] = old[k]
+
+
 def similarity_score(a, b):
     "similar compare a and b "
     return SequenceMatcher(None, a, b).ratio()
@@ -427,88 +475,166 @@ def duplicate_list_to_length(list: list[Any], target_length: int) -> list[Any]:
     return duplicated_list
 
 
-def _target_wrapper(target: Callable, stdout_pipe: Connection,
-                    stderr_pipe: Connection, *args, **kwargs) -> None:
-
-    class PipeWriter:
-
-        def __init__(self, conn: Connection):
-            self.conn = conn
-
-        def write(self, s: str):
-            self.conn.send_bytes(s.encode("UTF8"))
-
-        def flush(self):
-            pass
-
-    sys.stdout = PipeWriter(stdout_pipe)
-    sys.stderr = PipeWriter(stderr_pipe)
-    target(*args, **kwargs)
+# Check a certain percentage of elements in two tensors are within a tolerance
+def check_accuracy(a, b, atol, rtol, percent):
+    assert a.shape == b.shape
+    assert a.dtype == b.dtype
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
+    left = torch.abs(a - b)
+    right = atol + rtol * torch.abs(b)
+    count = torch.sum(left > right)
+    mismatch_percent = count / a.numel()
+    if not (mismatch_percent < 1 - percent):
+        raise Exception("Mismatch percentage is %f for rtol %f" %
+                        (mismatch_percent, rtol))
 
 
-def run_function_in_sub_process(target: Callable,
-                                args: tuple,
-                                kwargs: Mapping[str, Any],
-                                stop_waiting_criteria: Callable,
-                                poll_interval_seconds: int = 5,
-                                timeout_seconds: int = 240) -> Tuple[str, str]:
-    multiprocessing.set_start_method("spawn", force=True)
-    parent_stdout_pipe, child_stdout_pipe = multiprocessing.Pipe()
-    parent_stderr_pipe, child_stderr_pipe = multiprocessing.Pipe()
-    child_process = multiprocessing.Process(
-        target=_target_wrapper,
-        args=[target, child_stdout_pipe, child_stderr_pipe] + list(args),
-        kwargs=kwargs)
-    child_process.start()
-    child_stdout_pipe.close()
-    child_stderr_pipe.close()
+skip_ray = pytest.mark.skipif(
+    mpi_disabled(), reason="This test is skipped for Ray orchestrator.")
 
-    def _read_from_pipe(pipe: Connection):
-        out = ""
-        while pipe.poll(timeout=0.1):
-            try:
-                out += pipe.recv_bytes().decode("UTF8")
-            except Exception:
-                break
-        return out
 
-    child_stdout = ""
-    child_stderr = ""
+@dataclass(kw_only=True)
+class DeviceSleepCtl:
+    _cancellation_requested: bool = False
+
+    @property
+    def cancellation_requested(self):
+        return self._cancellation_requested
+
+    def cancel(self):
+        self._cancellation_requested = True
+
+
+@hostfunc
+def device_sleep(
+    duration_s: float,
+    *,
+    ctl: DeviceSleepCtl,
+    spin_s: float = 0.1,
+):
+    spin_iters = math.ceil(duration_s / spin_s)
+    for _ in range(spin_iters):
+        if ctl.cancellation_requested:
+            break
+        time.sleep(spin_s)
+
+
+class UutProvider(Protocol):
+
+    def __call__(self, is_warmup: bool) -> ContextManager[Callable[[], None]]:
+        ...
+
+
+@contextmanager
+def assert_no_cuda_sync(
+    sync_timeout_s: float = 5, ) -> Generator[None, None, None]:
+    """Check that the function does not stream synchronize."""
+    if int(os.environ.get("CUDA_LAUNCH_BLOCKING", 0)):
+        print("CUDA_LAUNCH_BLOCKING set, skipping 'assert_no_cuda_sync'")
+        yield None
+        return
+
+    # NB: This implementation only assumes that the CUDA operations performed
+    #     in the guarded scope use the currently selected CUDA stream. This
+    #     should also cover custom Torch ops as well as non-Torch kernels.
+    #
+    #     Python's faulthandler is used to provide tracebacks which can help
+    #     pin-pointing synchronizing code. This is combined with PyTorch's
+    #     less general (instrumentation based) tooling, which is expected
+    #     to provide improved error reporting for those issues which it can
+    #     detect.
+
+    sleep_finished_event = torch.cuda.Event()
+    scope_finished_event = torch.cuda.Event()
+
+    torch.cuda.synchronize()
+    sleep_ctl = DeviceSleepCtl()
+    faulthandler.dump_traceback_later(sync_timeout_s)
+    device_sleep(2 * sync_timeout_s, ctl=sleep_ctl)  # cancelled below
+    sleep_finished_event.record()
+    torch_debug_mode_orig = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
     try:
-        total_waiting_seconds = 0
-        while child_process.is_alive(
-        ) and total_waiting_seconds < timeout_seconds:
-            child_stdout += _read_from_pipe(parent_stdout_pipe)
-            child_stderr += _read_from_pipe(parent_stderr_pipe)
-            if stop_waiting_criteria(child_stdout, child_stderr):
-                break
-            time.sleep(poll_interval_seconds)
-            total_waiting_seconds += poll_interval_seconds
+        yield None
     finally:
-        parent_stdout_pipe.close()
-        parent_stderr_pipe.close()
-        if child_process.is_alive():
-            child_process.terminate()
+        torch.cuda.set_sync_debug_mode(torch_debug_mode_orig)
+    scope_finished_event.record()
 
-    assert total_waiting_seconds < timeout_seconds, "Reached timeout while waiting for target"
-    return child_stdout, child_stderr
+    assert not sleep_finished_event.query(
+    ), """sync code should return quickly"""
+    faulthandler.cancel_dump_traceback_later()
+
+    sleep_ctl.cancel()
+    scope_finished_event.synchronize()
 
 
-class EnvVarsContextManager:
+def run_test_with_warmup(
+    uut_provider: UutProvider,
+    warmup_sizes_bytes: tuple[int] = (4 * 2**30, ),
+    *,
+    max_sync_s: float | None,
+):
+    """Run UUT including setup and warmup.
 
-    def __init__(self, new_env_vars: dict[str, str]):
-        self._env_vars = new_env_vars
-        self._original_value = None
+    This is mainly used to check that the UUT does not CUDA device sync. Thus,
+    given that PyTorch's caching memory allocator can device sync when it runs
+    out of cached GPU memory segments, the warmup allocates some GPU memory.
 
-    def __enter__(self):
-        self._original_vars = {
-            var_name: os.environ[var_name]
-            for var_name in self._env_vars.keys() if var_name in os.environ
-        }
-        os.environ.update(self._env_vars)
+    The warmup also runs the test once. This avoids issues with things like lazy loading
+    of device code. The UUT provider can use the 'is_warmup' argument to adapt its
+    behavior to the warmup and final test runs.
 
-    def __exit__(self, type, value, traceback):
-        os.environ.update(self._original_vars)
-        for var_name in self._env_vars.keys():
-            if var_name not in self._original_vars:
-                os.environ.pop(var_name)
+    If max_sync_s is provided, this helper checks that the UUT does not device sync,
+    assuming that the sync (CPU) part of the code takes no longer than max_sync_s
+    seconds to complete.
+
+    It is the user's responsibility to ensure that the amount of submitted work
+    does not exceed the CUDA driver/device queue capacity, which would make
+    the execution appear synchronous.
+    """
+    with torch.cuda.Stream():
+        with uut_provider(is_warmup=True) as uut:
+            bufs = []
+            for warmup_size in warmup_sizes_bytes:
+                bufs.append(
+                    torch.ones(warmup_size,
+                               device=torch.cuda.current_device(),
+                               dtype=torch.int8))
+            del bufs
+            uut()
+
+        with uut_provider(is_warmup=False) as uut:
+            with (assert_no_cuda_sync(sync_timeout_s=max_sync_s)
+                  if max_sync_s is not None else nullcontext()):
+                uut()
+
+
+_pynvmlInited = False
+
+
+def get_current_process_gpu_memory(include_subprocess: bool = False) -> int:
+    """
+    Returns GPU memory usage for current process in bytes.
+    """
+    global _pynvmlInited
+    if not _pynvmlInited:
+        pynvml.nvmlInit()
+        _pynvmlInited = True
+
+    # Get current process ID
+    targets = [os.getpid()]
+    if include_subprocess:
+        targets.extend(
+            p.pid for p in psutil.Process(targets[0]).children(recursive=True))
+    targets = frozenset(targets)
+
+    # Get device handle for GPU 0
+    device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    # Get running processes
+    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(device_handle)
+
+    # Find current process
+    return sum(process.usedGpuMemory for process in processes
+               if process.pid in targets)

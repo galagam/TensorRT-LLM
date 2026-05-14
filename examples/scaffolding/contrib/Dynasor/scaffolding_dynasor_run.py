@@ -22,7 +22,18 @@ def parse_arguments():
     return args
 
 
-def test(prompts, proposer_worker, args):
+def main():
+    args = parse_arguments()
+
+    prompts = [
+        "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n",
+        "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
+        "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
+    ]
+
+    generation_worker = TRTLLMWorker.init_with_new_llm(
+        args.model_dir, backend="pytorch", max_num_tokens=args.max_num_tokens)
+
     dynasor_generation_controller = DynasorGenerationController(
         generation_dir=args.model_dir,
         max_tokens=args.max_num_tokens,
@@ -38,7 +49,7 @@ def test(prompts, proposer_worker, args):
             prototype_controller=majority_vote_controller,
             workers={
                 DynasorGenerationController.WorkerTag.GENERATION:
-                proposer_worker
+                generation_worker
             },
         )
     else:
@@ -47,50 +58,34 @@ def test(prompts, proposer_worker, args):
             prototype_controller=dynasor_generation_controller,
             workers={
                 DynasorGenerationController.WorkerTag.GENERATION:
-                proposer_worker
+                generation_worker
             },
         )
 
     if args.streaming:
 
         async def task(prompt: str):
-            i = 0
+            step = 0
             async for result in llm.generate_async(prompt):
-                i += 1
-                print(">>>", i, result)
-                async for output in result.cur_output:
-                    print(">>>", i, len(output.outputs[0].token_ids), "\n",
-                          output.outputs[0].text)
-            print(f">>> final output {len(result.outputs[0].token_ids)}\n",
-                  result.outputs[0].text)
+                step += 1
+                tokens_num = len(
+                    result.outputs[0].token_ids
+                ) if result.outputs[0].token_ids is not None else 0
+                print(">>>", step, tokens_num, "\n", result.outputs[0].text)
+            print(f">>> final output {tokens_num}\n", result.outputs[0].text)
 
         # Need to provide LLM's event loop to get results in the middle of the whole process.
         asyncio.run_coroutine_threadsafe(task(prompts[0]), llm.loop).result()
     else:
         results = llm.generate(prompts)
         for result in results:
-            print(result.output.outputs[0].text)
+            print(result.outputs[0].text)
 
     print(f"main shutting down...")
     llm.shutdown()
     print(f"worker shutting down...")
-    proposer_worker.shutdown()
+    generation_worker.shutdown()
     print(f"main shut down done")
-
-
-def main():
-    args = parse_arguments()
-
-    prompts = [
-        "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n",
-        "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
-        "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
-    ]
-
-    llm_worker = TRTLLMWorker.init_with_new_llm(
-        args.model_dir, backend="pytorch", max_num_tokens=args.max_num_tokens)
-
-    test(prompts, llm_worker, args)
 
 
 if __name__ == "__main__":

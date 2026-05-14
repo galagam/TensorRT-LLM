@@ -467,7 +467,7 @@ def load_hf_qwen(model_dir: str, load_model_on_cpu: bool = False):
     model = model_cls.from_pretrained(
         model_dir,
         device_map='auto' if not load_model_on_cpu else 'cpu',
-        torch_dtype='auto',
+        dtype='auto',
         trust_remote_code=True)
     return model
 
@@ -714,57 +714,58 @@ def convert_hf_qwen(hf_model,
                     dtype,
                     use_gemm_woq_plugin))
 
-        if qwen_type == "qwen2_moe" and moe_config and moe_config.has_moe():
+        if moe_config and moe_config.has_moe():
+            if qwen_type == "qwen2_moe":
+                # shared_expert for qwen2_moe
+                shared_expert_up_proj = model_params[
+                    f'model.layers.{l}.mlp.shared_expert.up_proj.weight']
+                shared_expert_down_proj = model_params[
+                    f'model.layers.{l}.mlp.shared_expert.down_proj.weight']
+                shared_expert_gate = model_params[
+                    f'model.layers.{l}.mlp.shared_expert.gate_proj.weight']
+                shared_expert_up_proj = split(shared_expert_up_proj,
+                                              mapping.tp_size,
+                                              mapping.tp_rank,
+                                              dim=0)
+                shared_expert_down_proj = split(shared_expert_down_proj,
+                                                mapping.tp_size,
+                                                mapping.tp_rank,
+                                                dim=1)
+                shared_expert_gate = split(shared_expert_gate,
+                                           mapping.tp_size,
+                                           mapping.tp_rank,
+                                           dim=0)
+                shared_expert_gate_up_proj = torch.concat(
+                    [shared_expert_up_proj, shared_expert_gate],
+                    dim=-2).to(dtype)
 
-            # shared_expert for qwen2_moe
-            shared_expert_up_proj = model_params[
-                f'model.layers.{l}.mlp.shared_expert.up_proj.weight']
-            shared_expert_down_proj = model_params[
-                f'model.layers.{l}.mlp.shared_expert.down_proj.weight']
-            shared_expert_gate = model_params[
-                f'model.layers.{l}.mlp.shared_expert.gate_proj.weight']
-            shared_expert_up_proj = split(shared_expert_up_proj,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
-            shared_expert_down_proj = split(shared_expert_down_proj,
-                                            mapping.tp_size,
-                                            mapping.tp_rank,
-                                            dim=1)
-            shared_expert_gate = split(shared_expert_gate,
-                                       mapping.tp_size,
-                                       mapping.tp_rank,
-                                       dim=0)
-            shared_expert_gate_up_proj = torch.concat(
-                [shared_expert_up_proj, shared_expert_gate], dim=-2).to(dtype)
+                ## mlp.shared_expert.gate_up_proj.weight
+                weights.update(
+                    get_tllm_linear_weight(shared_expert_gate_up_proj,
+                                           tllm_prex + 'mlp.shared_expert.fc.',
+                                           None, use_weight_only,
+                                           plugin_weight_only_quant_type, dtype,
+                                           use_gemm_woq_plugin))
 
-            ## mlp.shared_expert.gate_up_proj.weight
-            weights.update(
-                get_tllm_linear_weight(shared_expert_gate_up_proj,
-                                       tllm_prex + 'mlp.shared_expert.fc.',
-                                       None, use_weight_only,
-                                       plugin_weight_only_quant_type, dtype,
-                                       use_gemm_woq_plugin))
+                ## mlp.shared_expert.down_proj.weight
+                weights.update(
+                    get_tllm_linear_weight(
+                        shared_expert_down_proj.to(dtype),
+                        tllm_prex + 'mlp.shared_expert.proj.', None,
+                        use_weight_only, plugin_weight_only_quant_type, dtype,
+                        use_gemm_woq_plugin))
 
-            ## mlp.shared_expert.down_proj.weight
-            weights.update(
-                get_tllm_linear_weight(shared_expert_down_proj.to(dtype),
-                                       tllm_prex + 'mlp.shared_expert.proj.',
-                                       None, use_weight_only,
-                                       plugin_weight_only_quant_type, dtype,
-                                       use_gemm_woq_plugin))
-
-            moe_shared_expert_gate_weights = get_weight(
-                model_params, prefix + 'mlp.shared_expert_gate', dtype)
-            weights.update(
-                get_tllm_linear_weight(
-                    moe_shared_expert_gate_weights,
-                    tllm_prex + 'mlp.shared_expert_gate.',
-                    None,
-                    False,  # Router should never be quantized
-                    plugin_weight_only_quant_type,
-                    dtype,
-                    use_gemm_woq_plugin))
+                moe_shared_expert_gate_weights = get_weight(
+                    model_params, prefix + 'mlp.shared_expert_gate', dtype)
+                weights.update(
+                    get_tllm_linear_weight(
+                        moe_shared_expert_gate_weights,
+                        tllm_prex + 'mlp.shared_expert_gate.',
+                        None,
+                        False,  # Router should never be quantized
+                        plugin_weight_only_quant_type,
+                        dtype,
+                        use_gemm_woq_plugin))
 
             ## fine-grained experts
             rank_experts = list(range(moe_config.num_experts))
@@ -811,6 +812,7 @@ def convert_hf_qwen(hf_model,
                     plugin_weight_only_quant_type,
                     dtype,
                     use_gemm_woq_plugin))
+
         else:
             mlp_gate_weight = get_weight(model_params, prefix + key_list[2],
                                          dtype)
@@ -994,7 +996,7 @@ def quantize(hf_model_dir: str,
     hf_model = model_cls.from_pretrained(
         hf_model_dir,
         device_map='auto',
-        torch_dtype='auto' if not use_smooth_quant else torch.float16,
+        dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True).half()
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(

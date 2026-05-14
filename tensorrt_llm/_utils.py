@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,34 +19,72 @@ import json
 import linecache
 import math
 import os
+import socket
 import struct
+import sys
+import tempfile
+import threading
 import trace
+import traceback
 import weakref
 from contextlib import contextmanager
-from dataclasses import asdict
+from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
 from mpi4py import MPI
 from mpi4py.util import pkl5
 from packaging import version
+from typing_extensions import ParamSpec
 
 # isort: off
 import torch
 import tensorrt as trt
+
+try:
+    from pynvml import (
+        NVMLError,
+        nvmlDeviceGetCount,
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetHandleByUUID,
+        nvmlDeviceGetTotalEnergyConsumption,
+        nvmlInit,
+        nvmlShutdown,
+    )
+
+    has_nvml = True
+except ImportError:
+    has_nvml = False
 # isort: on
 
-from tensorrt_llm.bindings import DataType, GptJsonConfig
+from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
+
+
+def get_hf_rope_theta(config: Any, default: float = 10000.0) -> float:
+    """Return RoPE ``theta`` from a Hugging Face ``PreTrainedConfig``-like object.
+
+    Transformers v5+ nests ``rope_theta`` under ``rope_parameters`` for several
+    models (e.g. LLaMA); older releases expose ``config.rope_theta`` directly.
+    """
+    theta = getattr(config, "rope_theta", None)
+    if theta is not None:
+        return float(theta)
+    rope_params = getattr(config, "rope_parameters", None)
+    if isinstance(rope_params, dict):
+        theta = rope_params.get("rope_theta")
+        if theta is not None:
+            return float(theta)
+    return default
 
 
 def torch_to_numpy(x: torch.Tensor):
@@ -180,22 +218,46 @@ _str_to_binding_dtype_dict = dict(
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
+_binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
 
-_binding_dtype_size = {
-    DataType.INT64: 8,
-    DataType.FLOAT: 4,
-    DataType.INT32: 4,
-    DataType.BF16: 2,
-    DataType.HALF: 2,
-    DataType.BOOL: 1,
-    DataType.FP8: 1,
-    DataType.INT8: 1,
-    DataType.UINT8: 1,
+_binding_dtype_bits = {
+    DataType.INT64: 64,
+    DataType.FLOAT: 32,
+    DataType.INT32: 32,
+    DataType.BF16: 16,
+    DataType.HALF: 16,
+    DataType.BOOL: 8,
+    DataType.FP8: 8,
+    DataType.INT8: 8,
+    DataType.UINT8: 8,
+    DataType.NVFP4: 4,
 }
+
+
+def binding_layer_type_to_str(layer_type: LayerType) -> str:
+    return layer_type.name.lower()
+
+
+def binding_to_str_dtype(binding_dtype) -> str:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return ret
+
+
+def binding_to_torch_dtype(binding_dtype) -> torch.dtype:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return str_dtype_to_torch(ret)
 
 
 def binding_dtype_size(dtype: DataType):
     return _binding_dtype_size[dtype]
+
+
+def get_size_in_bytes(num_elements: int, dtype: DataType):
+    total_num_bits = _binding_dtype_bits[dtype] * num_elements
+    assert total_num_bits % 8 == 0, f"Total number of bits {total_num_bits} must be divisible by 8"
+    return total_num_bits // 8
 
 
 def str_dtype_to_binding(dtype):
@@ -410,6 +472,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.qint8: "|u1",
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
+    torch.uint8: "|u1",
 }
 
 
@@ -453,6 +516,22 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
+def get_free_port() -> int:
+    return get_free_ports(1)[0]
+
+
+def get_free_ports(num=1) -> List[int]:
+    sockets = [
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(num)
+    ]
+    for s in sockets:
+        s.bind(('', 0))
+    ports = [s.getsockname()[1] for s in sockets]
+    for s in sockets:
+        s.close()
+    return ports
+
+
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
@@ -464,7 +543,17 @@ def set_mpi_comm(new_comm):
     comm = new_comm
 
 
+thread_local_comm = threading.local()
+
+
+def set_thread_local_mpi_comm(new_comm):
+    thread_local_comm.value = new_comm
+
+
 def mpi_comm():
+    if hasattr(thread_local_comm,
+               "value") and thread_local_comm.value is not None:
+        return thread_local_comm.value
     return comm
 
 
@@ -475,11 +564,44 @@ def local_mpi_comm():
     return local_comm
 
 
+# Global TorchDist instance for Ray orchestrator
+_torch_comm = None
+
+
+def set_torch_comm(torch_comm_instance):
+    """Set global TorchDist instance"""
+    global _torch_comm
+    _torch_comm = torch_comm_instance
+
+
+def torch_comm():
+    """Get global TorchDist instance"""
+    if _torch_comm is None:
+        raise RuntimeError(
+            "TorchDist not initialized. Call set_torch_comm() first.")
+    return _torch_comm
+
+
+def mpi_disabled() -> bool:
+    """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
+    return os.environ.get("TLLM_DISABLE_MPI") == "1"
+
+
 def mpi_rank():
+    if mpi_disabled():
+        try:
+            return torch.distributed.get_rank()
+        except ValueError:
+            # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
+            return 0
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_rank():
+    if mpi_disabled():
+        # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
+        return 0
+
     return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
@@ -492,7 +614,15 @@ def mpi_world_size():
 
 
 def local_mpi_rank():
-    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    if mpi_disabled():
+        # For Ray/non-MPI: the device was already set during worker init
+        # torch.cuda.current_device() returns the correct local device ID
+        try:
+            return torch.cuda.current_device()
+        except ValueError:
+            return 0
+    return mpi_comm().Get_rank() % torch.cuda.device_count(
+    ) if ENABLE_MULTI_DEVICE else 0
 
 
 def local_mpi_size():
@@ -519,7 +649,7 @@ def local_mpi_barrier():
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
+    return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
 
 
 def mpi_allgather(obj):
@@ -676,10 +806,27 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+@lru_cache(maxsize=1)
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
+def print_all_stacks():
+    """Print stack traces for all threads"""
+    for thread_id, frame in sys._current_frames().items():
+        logger.error(f"Thread {thread_id} stack trace:\n" +
+                     "".join(traceback.format_stack(frame)))
+
+
 def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":
         return True
+    if value == "-1":
+        # early return w/o calling global_mpi_rank() for Ray path
+        return False
     try:
         return int(value) == global_mpi_rank()
     except ValueError:
@@ -728,38 +875,6 @@ def trace_func(func):
         return result
 
     return wrapper
-
-
-class DictConversion:
-
-    @classmethod
-    def from_dict(cls, config: Dict[str, Any]):
-        obj = cls()
-        fields = obj.__dataclass_fields__
-        for key, value in config.items():
-            assert hasattr(obj, key), f"cannot find {key} in {obj}"
-            field_cls = fields[key].type
-            if (isinstance(field_cls, type)
-                    and issubclass(field_cls, DictConversion)
-                    and isinstance(value, dict)):
-                value = field_cls.from_dict(value)
-            setattr(obj, key, value)
-        return obj
-
-    def to_dict(self):
-        return asdict(self)
-
-    @classmethod
-    def from_json_file(cls, file):
-        with open(file) as f:
-            return cls.from_dict(json.load(f))
-
-    def set_defaults(self, **kwargs):
-        for key, default in kwargs.items():
-            value = getattr(self, key)
-            if (value is None
-                    or (isinstance(value, (list, dict)) and len(value) == 0)):
-                setattr(self, key, default)
 
 
 class BaseEnumMeta(EnumMeta):
@@ -832,10 +947,13 @@ def _null_context_manager():
     yield
 
 
+_T = TypeVar("_T")
+
+
 def nvtx_range(msg: str,
                color: str = "grey",
                domain: str = "TensorRT-LLM",
-               category: Optional[str] = None):
+               category: Optional[str] = None) -> Callable[[_T], _T]:
     """
     Creates an NVTX range annotation for profiling.
 
@@ -881,6 +999,18 @@ def nvtx_range_debug(msg: str,
         return _null_context_manager()
 
 
+def nvtx_mark_debug(msg: str,
+                    color: str = "grey",
+                    domain: str = "TensorRT-LLM",
+                    category: Optional[str] = None) -> None:
+    """
+    Creates an NVTX marker for debugging purposes.
+    """
+    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
+            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        nvtx_mark(msg, color=color, domain=domain, category=category)
+
+
 def nvtx_mark(msg: str,
               color: str = "grey",
               domain: str = "TensorRT-LLM",
@@ -912,13 +1042,15 @@ class TensorWrapper:
     def __init__(
         self,
         data_ptr: int,
-        dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
+        dtype: Union[torch.dtype, str, np.dtype, trt.DataType, DataType],
         shape: Sequence[int],
+        strides: Optional[Sequence[int]] = None,
     ):
         assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
+        self.strides = strides
 
     def data_ptr(self):
         return self._data_ptr
@@ -932,7 +1064,8 @@ class TensorWrapper:
         return getattr(self, "_shape", None)
 
     @dtype.setter
-    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType]):
+    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType,
+                                 DataType]):
         if isinstance(dtype, torch.dtype):
             self._dtype = dtype
         elif isinstance(dtype, str):
@@ -941,6 +1074,8 @@ class TensorWrapper:
             self._dtype = np_dtype_to_torch(dtype)
         elif isinstance(dtype, trt.DataType):
             self._dtype = trt_dtype_to_torch(dtype)
+        elif isinstance(dtype, DataType):
+            self._dtype = binding_to_torch_dtype(dtype)
         else:
             raise TypeError(f"Unsupported dtype: {dtype}")
 
@@ -954,10 +1089,17 @@ class TensorWrapper:
     @property
     def __cuda_array_interface__(self):
         return {
-            "shape": self.shape,
-            "typestr": torch_dtype_to_np_typestr(self.dtype),
+            "shape":
+            self.shape,
+            "typestr":
+            torch_dtype_to_np_typestr(self.dtype),
             "data": (self.data_ptr() if self.numel() > 0 else 0, False),
-            "version": 3,
+            "strides": [
+                i * torch.tensor([], dtype=self.dtype).element_size()
+                for i in self.strides
+            ] if self.strides is not None else None,
+            "version":
+            3,
         }
 
     @staticmethod
@@ -1014,11 +1156,15 @@ class KVCacheEventSerializer:
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 
-        return {
+        json_str = {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
-            "window_size": event.window_size
+            "window_size": event.window_size,
         }
+        if event.attention_dp_rank is not None:
+            json_str["attention_dp_rank"] = event.attention_dp_rank
+
+        return json_str
 
     @staticmethod
     def _created_to_json(data):
@@ -1055,7 +1201,9 @@ class KVCacheEventSerializer:
             "cache_level":
             data.cache_level,
             "priority":
-            data.priority
+            data.priority,
+            "mm_keys":
+            KVCacheEventSerializer._mm_keys_to_json(data)
         }
 
     @staticmethod
@@ -1077,6 +1225,8 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _event_diff_to_json(data):
+        if data is None:
+            return None
         return {
             "type": "event_diff",
             "new_value": data.new_value,
@@ -1091,13 +1241,334 @@ class KVCacheEventSerializer:
             "token_extra_id": data.token_extra_id
         }
 
+    @staticmethod
+    def _mm_key_to_json(data):
+        # MmKey is a tuple of (hash_bytes, start_offset, uuid)
+        # where uuid is optional (None if content-hashed)
+        if len(data) == 3:
+            hash_array, start_offset, uuid = data
+        else:
+            # Backward compatibility: old format (hash_array, start_offset)
+            hash_array, start_offset = data
+            uuid = None
 
-def is_multi_device_enable():
+        # Convert array to hex string
+        hash_hex = ''.join(f'{b:02x}' for b in hash_array)
+
+        # Use UUID from C++ if available, otherwise use hash_hex
+        hash_or_uuid = uuid if uuid is not None else hash_hex
+
+        return {
+            "type": "mm_key",
+            "hash": hash_or_uuid,
+            "start_offset": start_offset
+        }
+
+    @staticmethod
+    def _mm_keys_to_json(data):
+        # MmKeys is a list of MmKey
+        if hasattr(data, 'mm_keys') and data.mm_keys:
+            return [
+                KVCacheEventSerializer._mm_key_to_json(mm_key)
+                for mm_key in data.mm_keys
+            ]
+        else:
+            return []
+
+
+def set_prometheus_multiproc_dir() -> object:
+    # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.info(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def confidential_compute_enabled() -> bool:
     """
-    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
-    So we can avoid broadcast calls on single GPU.
-    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
-    ENABLE_MULTI_DEVICE is true by default when building tensorrt-llm so we need to also check
-    the number of devices
+    Query NVML for the confidential compute state
     """
-    return local_mpi_size() > 1
+
+    try:
+        import pynvml
+    except ImportError:
+        logger.error("pynvml not available; assuming CC=off")
+        return False
+
+    cc_enabled = False
+
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode
+            == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = (
+                cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED)
+        except Exception as e:
+            logger.error(f"Error querying confidential compute state: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error querying confidential compute state: {str(e)}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
+
+
+@lru_cache(maxsize=None)
+def prefer_pinned() -> bool:
+    """
+    Returns whether pinned memory is beneficial for performance.
+
+    While pinned memory is typically preferred for H2D and D2H transfers, it
+    offers no advantage when Confidential Compute (CC) is enabled. In fact, CC
+    forces most transfers to be synchronous. The exception is pageable H2D
+    copies smaller than 2MB, which remain asynchronous.
+
+    Since input preparation relies heavily on these small H2D copies, usage of
+    pageable (and not pinned) memory across the board is preferred in CC mode
+    to maintain asynchronous execution.
+    """
+    return not confidential_compute_enabled()
+
+
+def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Pin the Tensor memory if pinning is preferred/beneficial for performance
+    """
+    if prefer_pinned():
+        return tensor.pin_memory()
+    return tensor
+
+
+P = ParamSpec("P")
+
+
+# From: https://stackoverflow.com/a/4104188/2749989
+def run_once(f: Callable[P, None]) -> Callable[P, None]:
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        if not wrapper.has_run:  # type: ignore[attr-defined]
+            wrapper.has_run = True  # type: ignore[attr-defined]
+            return f(*args, **kwargs)
+
+    wrapper.has_run = False  # type: ignore[attr-defined]
+    return wrapper
+
+
+TORCH_PYBIND11_ABI = None
+
+
+def torch_pybind11_abi() -> str:
+    global TORCH_PYBIND11_ABI
+    if TORCH_PYBIND11_ABI is None:
+        if hasattr(torch._C, '_PYBIND11_COMPILER_TYPE'):
+            # Old pybind11 abi string before torch 2.9.0
+            TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+        else:
+            # New pybind11 abi string since torch 2.9.0
+            TORCH_PYBIND11_ABI = f"system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_{int(torch.compiled_with_cxx11_abi())}"
+    return TORCH_PYBIND11_ABI
+
+
+@lru_cache(maxsize=1)
+def is_device_integrated() -> bool:
+    """Check if the current GPU device is integrated (shares physical memory with CPU).
+
+    Integrated GPU systems include DGX Spark and other unified memory architectures.
+    This function caches the result to avoid repeated CUDA device property queries.
+
+    Returns:
+        bool: True if the GPU is integrated, False otherwise. Returns False if CUDA
+              is not available.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_properties().is_integrated
+
+
+# Environment variable to enable garbage collection profiling.
+# Set to "1" to enable recording of garbage collection events during profiling.
+PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
+
+
+class _GCNvtxHandle:
+    """Handle object for GC NVTX watcher to keep it alive."""
+
+
+# Singleton for the GC NVTX watcher handle.
+_gc_watcher_handle: Optional[_GCNvtxHandle] = None
+
+
+def _setup_gc_nvtx_profiling() -> Optional[_GCNvtxHandle]:
+    """
+    Set up NVTX range markers for Python garbage collection events (singleton).
+    This helps in profiling to visualize when GC occurs during execution.
+
+    This function is called automatically at module import time. The environment
+    variable TLLM_PROFILE_RECORD_GC must be set before importing this module.
+
+    This is an internal function and should not be called directly by users.
+
+    Returns:
+        _GCNvtxHandle or None: A handle object that keeps the GC callback alive,
+                               or None if GC profiling is not enabled.
+    """
+    global _gc_watcher_handle
+
+    # Return existing handle if already initialized
+    if _gc_watcher_handle is not None:
+        return _gc_watcher_handle
+
+    enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
+    if not enabled:
+        return None
+
+    range_id: Optional[int] = None
+
+    def gc_callback(phase, _):
+        nonlocal range_id
+        if phase == "start":
+            assert range_id is None, "Unexpected state in GC callback: another GC while last GC not finished?"
+            range_id = torch.cuda.nvtx.range_start("Python GC")
+        elif phase == "stop":
+            assert range_id is not None, "Unexpected state in GC callback: no active GC but got GC finished?"
+            torch.cuda.nvtx.range_end(range_id)
+            range_id = None
+
+    gc.callbacks.append(gc_callback)
+
+    def gc_cleanup(callback):
+        try:
+            gc.callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    handle = _GCNvtxHandle()
+    weakref.finalize(handle, gc_cleanup, gc_callback)
+
+    _gc_watcher_handle = handle
+    return handle
+
+
+# Initialize GC NVTX profiling singleton at module import time
+_setup_gc_nvtx_profiling()
+
+
+class EnergyMonitor:
+    """Context manager that tracks GPU energy consumption via NVML.
+
+    Measures total energy (Joules) across all GPUs used by the process,
+    scaling by world_size / device_count for multi-node setups.
+    """
+
+    def __init__(self, world_size):
+        self._enabled = has_nvml
+        self._world_size = world_size
+        self._start_energies = None
+        self._total_energy = None
+        if self._enabled:
+            try:
+                nvmlInit()
+                self._handles = self._get_gpu_handles(world_size)
+                self._device_count = len(self._handles)
+            except (NVMLError, ValueError) as e:
+                logger.warning(f"Failed to initialize NVML: {e}")
+                self._enabled = False
+
+    @staticmethod
+    def _get_gpu_handles(world_size):
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        device_ids = ([e.strip() for e in cuda_visible.split(",")
+                       if e.strip()] if cuda_visible else [])
+
+        if not device_ids:
+            count = min(nvmlDeviceGetCount(), world_size)
+            return [nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+
+        handles = []
+        for device_id in device_ids[:world_size]:
+            if device_id.startswith(("GPU-", "MIG-")):
+                handles.append(nvmlDeviceGetHandleByUUID(device_id))
+            else:
+                handles.append(nvmlDeviceGetHandleByIndex(int(device_id)))
+        return handles
+
+    def __enter__(self):
+        if self._enabled:
+            try:
+                self._start_energies = [
+                    nvmlDeviceGetTotalEnergyConsumption(handle)
+                    for handle in self._handles
+                ]
+            except NVMLError as e:
+                logger.warning(f"Failed to read GPU energy on start: {e}")
+                self._start_energies = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._enabled or self._start_energies is None:
+            return False
+
+        try:
+            total_energy = 0.0
+            for handle, start_energy in zip(self._handles,
+                                            self._start_energies):
+                energy = (nvmlDeviceGetTotalEnergyConsumption(handle) -
+                          start_energy) / 1000.0
+                total_energy += energy
+            self._total_energy = (total_energy * self._world_size /
+                                  self._device_count)
+        except NVMLError as e:
+            logger.warning(f"Failed to read GPU energy on stop: {e}")
+        finally:
+            try:
+                nvmlShutdown()
+            except NVMLError:
+                pass
+        return False
+
+    def get_current_energy(self):
+        """Get total energy consumed (Joules) since __enter__ without stopping.
+
+        Unlike total_energy which is only available after __exit__, this method
+        can be called at any point while the monitor is active to get a live
+        reading of energy consumed so far.
+        """
+        if not self._enabled:
+            return None
+        try:
+            total_energy = 0.0
+            for handle in self._handles:
+                total_energy += nvmlDeviceGetTotalEnergyConsumption(
+                    handle) / 1000.0
+            return total_energy * self._world_size / self._device_count
+        except NVMLError as e:
+            logger.warning(f"Failed to read GPU energy: {e}")
+            return None
+
+    @property
+    def total_energy(self):
+        return self._total_energy

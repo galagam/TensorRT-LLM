@@ -189,6 +189,12 @@ class PixtralVisionModel(torch.nn.Module):
             dtype=self.config.torch_dtype,
         )
         self.transformer = PixtralTransformer(model_config)
+        if getattr(self.config, "rope_parameters", None) is None:
+            rope_theta = getattr(self.config, "rope_theta", 10000.0)
+            self.config.rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": rope_theta,
+            }
         self._patch_positional_embedding = (
             transformers.models.pixtral.modeling_pixtral.PixtralRotaryEmbedding(self.config)
         )
@@ -215,9 +221,13 @@ class PixtralVisionModel(torch.nn.Module):
         patch_embeds = torch.cat(flattened_embeds, dim=0)
         patch_embeds = self.ln_pre(patch_embeds)
 
-        position_ids = transformers.models.pixtral.modeling_pixtral.position_ids_in_meshgrid(
-            patch_embeds_list, max_width=self.config.image_size // self.config.patch_size
-        )
+        # The `position_ids_in_meshgrid` code does not look at the inputs' device to create the
+        # `position_ids`, so it ends up defaulting to CPU, which will incur an H2D copy later down
+        # the line. We therefore use this `torch.device` context manager here.
+        with torch.device(device=pixel_values.device):
+            position_ids = transformers.models.pixtral.modeling_pixtral.position_ids_in_meshgrid(
+                patch_embeds_list, max_width=self.config.image_size // self.config.patch_size
+            )
         position_embeddings = self._patch_positional_embedding(patch_embeds, position_ids)
 
         attn_metadata = self._prepare_attn_metadata(

@@ -13,13 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion
 {
 template <int NRanks>
 struct SyncComm
@@ -67,9 +70,9 @@ struct LamportComm
     {
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
+        clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
-        int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+        auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
         clear_size = *clear_ptr;
         int data_offset = flag_value % 3;
         int clear_offset = (flag_value + 2) % 3;
@@ -85,7 +88,7 @@ struct LamportComm
         }
     }
 
-    __device__ __forceinline__ void update(int new_clear_size)
+    __device__ __forceinline__ void update(int64_t new_clear_size)
     {
         if (blockIdx.x == 0 && threadIdx.x == 0)
         {
@@ -100,10 +103,10 @@ struct LamportComm
 
     int* counter_ptr;
     int* flag_ptr;
-    int* clear_ptr;
+    int64_t* clear_ptr;
     uint8_t* data_bufs[NRanks];
     uint8_t* clear_buf;
-    int clear_size;
+    int64_t clear_size;
     int flag_value;
 };
 
@@ -136,6 +139,7 @@ public:
             {
                 st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
             }
+
             while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
             {
             }
@@ -256,9 +260,9 @@ public:
             constexpr int SF_VEC_SIZE = 16;
             using PackedVec = PackedVec<DType>;
             PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(std::nullopt, token_id,
-                m_access_id_in_token, std::nullopt, m_params.hidden_dim,
-                reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, token_id, m_access_id_in_token,
+                std::nullopt, m_params.hidden_dim / SF_VEC_SIZE, reinterpret_cast<uint32_t*>(m_params.scale_out),
+                m_params.layout);
             reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
                 = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
         }
@@ -647,8 +651,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         }
     }
     int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
+    // Cluster launch is supported on Hopper (SM90) and datacenter Blackwell (SM100/SM103),
+    // but NOT on workstation Blackwell (SM120/SM121) which lacks cluster launch hardware.
     int cluster_size;
-    if (SM >= 90)
+    bool const supports_cluster = (SM >= 90 && SM < 120);
+    if (supports_cluster)
     {
         cluster_size = 8;
     }
@@ -690,7 +697,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     attribute[1].val.clusterDim.y = 1;
     attribute[1].val.clusterDim.z = 1;
     cfg.attrs = attribute;
-    cfg.numAttrs = SM >= 90 ? 2 : 0;
+    cfg.numAttrs = supports_cluster ? 2 : 0;
     if (oneshot)
     {
         bool trigger_completion_at_end = params.trigger_completion_at_end;
@@ -778,6 +785,10 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
                 "DType=float!");                                                                                       \
         }                                                                                                              \
     }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARRMSNorm)                                                     \
+    {                                                                                                                  \
+        DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARRMSNorm, NRanks);                                          \
+    }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");                                  \
@@ -814,4 +825,6 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     DISPATCH_RANKS(16);
     TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported ranks number!");
 }
-}; // namespace tensorrt_llm::kernels::ar_fusion
+}; // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END

@@ -29,6 +29,8 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
+ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
+
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
 
 BUILD_JOBS = "32"
@@ -89,6 +91,26 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                                         - "rl300-0045.ipp2u1.colossus"
                                         - "rl300-0046.ipp2u1.colossus"
                                         - "rl300-0047.ipp2u1.colossus"
+        """
+    }
+
+    if (arch == "amd64") {
+        // For x86_64, we block some nodes to avoid unstable network access.
+        selectors += """
+                affinity:
+                    nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: "kubernetes.io/hostname"
+                                      operator: NotIn
+                                      values:
+                                        - "sc-ipp-blossom-prod-k8w-105"
+                                        - "sc-ipp-blossom-prod-k8w-114"
+                                        - "sc-ipp-blossom-prod-k8w-115"
+                                        - "sc-ipp-blossom-prod-k8w-121"
+                                        - "sc-ipp-blossom-prod-k8w-123"
+                                        - "sc-ipp-blossom-prod-k8w-124"
         """
     }
 
@@ -153,8 +175,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     }
     def nodeLabelPrefix = "cpu"
     def jobName = "llm-build-images"
-    def buildID = env.BUILD_ID
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
+    def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix, jobName)
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -193,6 +214,11 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
+    if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
+        echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
+        return ""
+    }
+
     if (TRIGGER_TYPE != "post-merge") {
         echo "Trigger type is not post-merge, skip preparing wheel from build stage"
         return ""
@@ -245,18 +271,18 @@ def buildImage(config, imageKeyToTag)
     stage (config.stageName) {
         // Step 1: Clone TRT-LLM source codes
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
-        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, false, true)
     }
 
     // Step 2: Build the images
-    stage ("Install packages") {
+    stage ("Install Package") {
         sh "pwd && ls -alh"
-        sh "env"
+        sh "env | sort"
         sh "apk add make git"
         sh "git config --global --add safe.directory '*'"
 
         withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
         }
 
         withCredentials([
@@ -267,30 +293,40 @@ def buildImage(config, imageKeyToTag)
             ),
             string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
         ]) {
-            sh "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}"
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
         }
     }
     def containerGenFailure = null
     try {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
-        def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+
+        if (target == "rockylinux8") {
+            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        } else if (target =~ /^ubuntu\d+$/) {
+            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^${target}_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        }
+
+        // Replace the base image and triton image with the internal mirror
+        BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
+        TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
-                retry(3) {
-                    sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
-                }
-                retry(3) {
-                    sh """
-                    cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
-                    TORCH_INSTALL_TYPE=${torchInstallType} \
-                    IMAGE_WITH_TAG=${dependentImageWithTag} \
-                    STAGE=${dependent.dockerfileStage} \
-                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                    """
-                }
+                def randomSleep = (Math.random() * 600 + 600).toInteger()
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                trtllm_utils.llmExecStepWithRetry(this, script: """
+                cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
+                TORCH_INSTALL_TYPE=${torchInstallType} \
+                IMAGE_WITH_TAG=${dependentImageWithTag} \
+                STAGE=${dependent.dockerfileStage} \
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
@@ -298,7 +334,7 @@ def buildImage(config, imageKeyToTag)
             }
         }
 
-        args += prepareWheelFromBuildStage(dockerfileStage, arch)
+        def buildWheelArgs = prepareWheelFromBuildStage(dockerfileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
@@ -308,17 +344,36 @@ def buildImage(config, imageKeyToTag)
             }
         }
         stage ("make ${target}_${action} (${arch})") {
-            retry(3) {
-                sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
-            }
-            retry(3) {
-                sh """
+            sh "env | sort"
+            def randomSleep = (Math.random() * 600 + 600).toInteger()
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+            try {
+                trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${imageWithTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                """
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+            } catch (InterruptedException ex) {
+                throw ex
+            } catch (Exception ex) {
+                if (buildWheelArgs.trim().isEmpty()) {
+                    throw ex
+                }
+                echo "Build failed with wheel arguments, retrying without them"
+                buildWheelArgs = ""
+                trtllm_utils.llmExecStepWithRetry(this, script: """
+                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
+                TORCH_INSTALL_TYPE=${torchInstallType} \
+                IMAGE_WITH_TAG=${imageWithTag} \
+                STAGE=${dockerfileStage} \
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             }
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
@@ -326,20 +381,22 @@ def buildImage(config, imageKeyToTag)
         }
 
         if (customTag) {
-            stage ("custom tag: ${customTag} (${arch})") {
+            stage ("Custom Tag: ${customTag} (${arch})") {
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${customImageWithTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
             }
         }
     } catch (Exception ex) {
         containerGenFailure = ex
     } finally {
-        stage ("Docker logout") {
+        stage ("Docker Logout") {
             withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
                 sh "docker logout urm.nvidia.com"
                 sh "docker logout ${DEFAULT_GIT_URL}:5005"
@@ -368,14 +425,14 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 
     def release_action = params.action
     def buildConfigs = [
-        "Build trtllm release (x86_64)": [
+        "Build Internal release (x86_64 trtllm)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
             dockerfileStage: "release",
         ],
-        "Build trtllm release (SBSA)": [
+        "Build Internal release (SBSA trtllm)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
@@ -383,21 +440,27 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             arch: "arm64",
             dockerfileStage: "release",
         ],
-        "Build CI image (x86_64 tritondevel)": [:],
-        "Build CI image (SBSA tritondevel)": [
+        "Build CI Image (x86_64 tritondevel)": [:],
+        "Build CI Image (SBSA tritondevel)": [
             arch: "arm64",
         ],
-        "Build CI image (RockyLinux8 Python310)": [
+        "Build CI Image (RockyLinux8 Python310)": [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
         ],
-        "Build CI image (RockyLinux8 Python312)": [
+        "Build CI Image (RockyLinux8 Python312)": [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build NGC devel and release (x86_64)": [
+        "Build CI Image (SBSA Ubuntu24.04 Python312)": [
+            arch: "arm64",
+            target: "ubuntu24",
+            args: "PYTHON_VERSION=3.12.3",
+            postTag: "-py312",
+        ],
+        "Build NGC devel And release (x86_64)": [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
@@ -408,7 +471,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             ],
             dockerfileStage: "release",
         ],
-        "Build NGC devel and release (SBSA)": [
+        "Build NGC devel And release (SBSA)": [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
@@ -527,7 +590,7 @@ pipeline {
                 }
             }
         }
-        stage("Upload Artifacts") {
+        stage("Upload Artifact") {
             steps {
                 script {
                     String imageKeyToTagJson = writeJSON returnText: true, json: imageKeyToTag
@@ -538,7 +601,7 @@ pipeline {
                 }
             }
         }
-        stage("Wait for Build Jobs Complete") {
+        stage("Wait For Build Job Complete") {
             when {
                 expression {
                     RUN_SANITY_CHECK
@@ -546,58 +609,60 @@ pipeline {
             }
             steps {
                 script {
-                    container("python3") {
-                        // Install wget
-                        trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        container("python3") {
+                            // Install wget
+                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget")
 
-                        // Poll for build artifacts
-                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
-                        def requiredFiles = [
-                            "TensorRT-LLM-GH200.tar.gz",
-                            "TensorRT-LLM.tar.gz"
-                        ]
-                        def maxWaitMinutes = 60
-                        def pollIntervalSeconds = 60
+                            // Poll for build artifacts
+                            def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                            def requiredFiles = [
+                                "TensorRT-LLM-GH200.tar.gz",
+                                "TensorRT-LLM.tar.gz"
+                            ]
+                            def maxWaitMinutes = 60
+                            def pollIntervalSeconds = 60
 
-                        echo "Waiting for build artifacts..."
-                        echo "Required files: ${requiredFiles}"
+                            echo "Waiting for build artifacts..."
+                            echo "Required files: ${requiredFiles}"
 
-                        def startTime = System.currentTimeMillis()
-                        def maxWaitMs = maxWaitMinutes * 60 * 1000
+                            def startTime = System.currentTimeMillis()
+                            def maxWaitMs = maxWaitMinutes * 60 * 1000
 
-                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
-                            def missingFiles = []
+                            while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                                def missingFiles = []
 
-                            for (file in requiredFiles) {
-                                def fileUrl = "${artifactBaseUrl}${file}"
-                                def exitCode = sh(
-                                    script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
-                                    returnStatus: true
-                                )
+                                for (file in requiredFiles) {
+                                    def fileUrl = "${artifactBaseUrl}${file}"
+                                    def exitCode = sh(
+                                        script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
+                                        returnStatus: true
+                                    )
 
-                                if (exitCode != 0) {
-                                    missingFiles.add(file)
+                                    if (exitCode != 0) {
+                                        missingFiles.add(file)
+                                    }
                                 }
-                            }
 
-                            if (missingFiles.isEmpty()) {
-                                echo "All build artifacts are ready!"
-                                return
+                                if (missingFiles.isEmpty()) {
+                                    echo "All build artifacts are ready!"
+                                    return
+                                }
+
+                                def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                                echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                                echo "Missing files: ${missingFiles}"
+                                sleep(pollIntervalSeconds)
                             }
 
                             def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                            echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
-                            echo "Missing files: ${missingFiles}"
-                            sleep(pollIntervalSeconds)
+                            error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                         }
-
-                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                        error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                     }
                 }
             }
         }
-        stage("Sanity Check for NGC Images") {
+        stage("Sanity Check For NGC Image") {
             when {
                 expression {
                     RUN_SANITY_CHECK
@@ -605,35 +670,35 @@ pipeline {
             }
             steps {
                 script {
-                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    def parameters = getCommonParameters()
-                    parameters += [
-                        'enableFailFast': false,
-                        'globalVars': globalVarsJson,
-                    ]
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
+                        def parameters = getCommonParameters()
+                        parameters += [
+                            'enableFailFast': false,
+                            'globalVars': globalVarsJson,
+                        ]
 
-                    echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
+                        echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
 
-                    def status = ""
-                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
-                    def handle = build(
-                        job: jobName,
-                        parameters: trtllm_utils.toBuildParameters(parameters),
-                        propagate: false,
-                    )
-                    echo "Triggered job: ${handle.absoluteUrl}"
-                    status = handle.result
+                        def status = ""
+                        def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                        def handle = build(
+                            job: jobName,
+                            parameters: trtllm_utils.toBuildParameters(parameters),
+                            propagate: false,
+                        )
+                        echo "Triggered job: ${handle.absoluteUrl}"
+                        status = handle.result
 
-                    if (status != "SUCCESS") {
-                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        if (status != "SUCCESS") {
                             error "Downstream job did not succeed"
                         }
                     }
                 }
             }
         }
-        stage("Register NGC Images for Security Checks") {
+        stage("Register NGC Image For Security Check") {
             when {
                 expression {
                     return params.nspect_id && params.action == "push"
@@ -641,33 +706,41 @@ pipeline {
             }
             steps {
                 script {
-                    container("python3") {
-                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
-                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "58ee430c8c3bd36bee2073405a547d3f8bc1932f"
-                        withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
-                            trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
-                        }
-                        def nspect_env = params.nspect_env ? params.nspect_env : "prod"
-                        def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
-                        def cmd = """./nspect/nspect.py \
-                            --env ${nspect_env} \
-                            --nspect_id ${params.nspect_id} \
-                            --program_version_name '${program_version_name}' \
-                            """
-                        if (params.register_images) {
-                            cmd += "--register "
-                        }
-                        if (params.osrb_ticket) {
-                            cmd += "--osrb_ticket ${params.osrb_ticket} "
-                        }
-                        if (params.wait_success_seconds) {
-                            cmd += "--check_launch_api "
-                            cmd += "--wait_success ${params.wait_success_seconds} "
-                        }
-                        cmd += imageKeyToTag.values().join(" ")
-                        withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            sh cmd
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        container("python3") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
+                            if (override_commit) {
+                                echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
+                            nspect_commit = override_commit
+                            }
+                            withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
+                                trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
+                            }
+                            def nspect_env = params.nspect_env ? params.nspect_env : "prod"
+                            def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                            def cmd = """./nspect/nspect.py \
+                                --env ${nspect_env} \
+                                --nspect_id ${params.nspect_id} \
+                                --program_version_name '${program_version_name}' \
+                                """
+                            if (params.register_images) {
+                                cmd += "--register "
+                            }
+                            if (params.osrb_ticket) {
+                                cmd += "--osrb_ticket ${params.osrb_ticket} "
+                            }
+                            if (params.wait_success_seconds) {
+                                cmd += "--check_launch_api "
+                                cmd += "--wait_success ${params.wait_success_seconds} "
+                            }
+                            cmd += "--image "
+                            cmd += imageKeyToTag.values().join(" ")
+                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                            }
                         }
                     }
                 }

@@ -1,11 +1,11 @@
-from itertools import chain
+from typing import Optional
 
 from ordered_set import OrderedSet
 
 from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import *
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
@@ -24,7 +24,7 @@ class NGramPoolManager(BaseResourceManager):
     `matches` is a list of candidate draft token ids attaching to a pattern.
 
     Arguments:
-        max_draft_len: int
+        max_total_draft_tokens: int
             The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
 
         max_matching_ngram_size: int
@@ -50,7 +50,7 @@ class NGramPoolManager(BaseResourceManager):
 
     def __init__(self, spec_config: "NGramDecodingConfig",
                  max_num_requests: int):
-        self.max_draft_len = spec_config.max_draft_len
+        self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
         self.is_use_oldest = spec_config.is_use_oldest  # TODO: remove this if updating strategy is supported
@@ -74,8 +74,7 @@ class NGramPoolManager(BaseResourceManager):
             return
 
         # Remove the pairs if the request is completed in private pool mode.
-        for request in chain(scheduled_batch.context_requests,
-                             scheduled_batch.generation_requests):
+        for request in scheduled_batch.all_requests():
             if request.state == LlmRequestState.GENERATION_COMPLETE:
                 request_id = request.request_id
                 if request_id in self.pool:
@@ -86,13 +85,13 @@ class NGramPoolManager(BaseResourceManager):
         self,
         prefix: list[int],
         request_id: int,
-        end_id: int,
         max_sequence_length: int,
     ):
         prefix_len = len(prefix)
         max_draft_token_length_this_step = max_sequence_length - 1 - prefix_len
         if max_draft_token_length_this_step <= 0:  # No draft token is need if the prefix is long enough
-            return [end_id]
+            return []
+
         if request_id not in self.start_index:  # Extend start_index and pool for a new request
             self.start_index[request_id] = 0
             if not self.is_public_pool:
@@ -106,7 +105,7 @@ class NGramPoolManager(BaseResourceManager):
                           -1):
             # Find each possible pattern-match combination, and use tuple for hash
             for l in range(len(sequence) - size):
-                r = min(l + size + self.max_draft_len, len(sequence))
+                r = min(l + size + self.max_total_draft_tokens, len(sequence))
                 pattern = tuple(sequence[l:l + size])
                 new_match = tuple(sequence[l + size:r])
                 if pattern not in pool or \
@@ -124,8 +123,7 @@ class NGramPoolManager(BaseResourceManager):
                             pool[pattern].remove(match)
                     pool[pattern].add(new_match)
 
-        # Find match
-        draft_tokens = [end_id]  # fallback value
+        draft_tokens = []
         for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
                           -1):
             pattern = tuple(prefix[-size:])
@@ -138,7 +136,7 @@ class NGramPoolManager(BaseResourceManager):
         # Update start_index
         self.start_index[request_id] = max(
             0, prefix_len -
-            (self.max_draft_len + self.max_matching_ngram_size - 1))
+            (self.max_total_draft_tokens + self.max_matching_ngram_size - 1))
 
         return draft_tokens
 
@@ -162,25 +160,30 @@ class NGramPoolManager(BaseResourceManager):
 
 class NGramDrafter(Drafter):
 
+    _needs_padding_kv_extension = True
+
     def __init__(
         self,
         spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
+        super().__init__(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            max_concurrency=spec_config.max_concurrency,
+            draft_len_schedule=spec_config.draft_len_schedule)
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
+        self.spec_resource_manager = ngram_pool_manager
         self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
-        self.spec_resource_manager = ngram_pool_manager
+        self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
+        assert self.max_draft_len == self.max_total_draft_tokens, "NGram only supports linear tree."
 
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
-        # Disable NGram speculative decoding auto heuristic for batch size > 32.
-        if self.spec_config.is_auto_heuristic and len(
-                scheduled_requests.all_requests()) > 32:
-            return
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
@@ -190,17 +193,19 @@ class NGramDrafter(Drafter):
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
             # Add new token to a copy of the generated tokens to find new draft tokens
-            prefix = list(request.get_tokens()[0])  # Get a copy
+            prefix = list(request.get_tokens(0))  # Get a copy
 
             # Generate draft tokens
             draft_tokens = self.spec_resource_manager.get_draft_tokens(
                 prefix,
                 request.request_id,
-                request.py_end_id,
-                request.py_orig_prompt_len + request.py_max_new_tokens,
+                max_sequence_length=request.py_orig_prompt_len +
+                request.py_max_new_tokens,
             )
-            # Pad length to `self.max_draft_len`
-            if len(draft_tokens) > 0:
-                pad_length = self.max_draft_len - len(draft_tokens)
-                draft_tokens.extend([request.py_end_id] * pad_length)
             request.py_draft_tokens = draft_tokens
+
+    def update_max_total_draft_tokens(self,
+                                      new_max_total_draft_tokens: int) -> None:
+        """Override to propagate to NGramPoolManager."""
+        super().update_max_total_draft_tokens(new_max_total_draft_tokens)
+        self.spec_resource_manager.max_total_draft_tokens = new_max_total_draft_tokens

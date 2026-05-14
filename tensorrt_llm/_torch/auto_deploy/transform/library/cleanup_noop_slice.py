@@ -6,7 +6,7 @@ from torch.fx import GraphModule
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
-from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
 @TransformRegistry.register("cleanup_noop_slice")
@@ -19,7 +19,11 @@ class CleanupNoopSlice(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         num_matches = 0
         for node in gm.graph.nodes:
@@ -44,6 +48,11 @@ class CleanupNoopSlice(BaseTransform):
             num_matches += 1
 
         # store info object about the transform
-        info = TransformInfo(skipped=False, num_matches=num_matches)
+        info = TransformInfo(
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
+        )
 
         return gm, info

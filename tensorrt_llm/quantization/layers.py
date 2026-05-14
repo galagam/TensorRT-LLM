@@ -1967,7 +1967,11 @@ class Fp8RowwiseAttention(Module):
         lora_layer_params=None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
-        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
+        assert lora_layer_params is None, (
+            f"LoRA is not supported by {self.__class__.__name__} (e.g., --use_fp8_rowwise). "
+            "If you need LoRA support, please use a non-quantized (e.g., bf16) attention implementation. "
+            "See https://github.com/NVIDIA/TensorRT-LLM/issues/2603 for details."
+        )
         qkv = self.qkv(hidden_states)
 
         alibi_slopes = None
@@ -2218,7 +2222,7 @@ class FP4Linear(Linear):
                     qkv_block_scale,
                     tllm_key.replace(
                         'weight', "weights_block_scaling_factor_interleaved"):
-                    torch.ops.trtllm.nvfp4_block_scale_interleave(
+                    torch.ops.trtllm.block_scale_interleave(
                         qkv_block_scale.view(
                             torch.uint8).cpu().contiguous()).reshape(
                                 qkv_block_scale.shape).view(
@@ -2238,7 +2242,7 @@ class FP4Linear(Linear):
             elif tllm_key.endswith("weights_block_scaling_factor"):
                 return weights
             elif tllm_key.endswith("weights_block_scaling_factor_interleaved"):
-                return torch.ops.trtllm.nvfp4_block_scale_interleave(
+                return torch.ops.trtllm.block_scale_interleave(
                     weights.view(torch.uint8).cpu().contiguous()).reshape(
                         weights.shape).view(torch.float8_e4m3fn)
             elif tllm_key.endswith("weights_global_scaling_factor"):
@@ -2379,7 +2383,7 @@ class FP4RowLinear(RowLinear):
         elif tllm_key.endswith("weights_block_scaling_factor"):
             return weights
         elif tllm_key.endswith("weights_block_scaling_factor_interleaved"):
-            return torch.ops.trtllm.nvfp4_block_scale_interleave(
+            return torch.ops.trtllm.block_scale_interleave(
                 weights.view(torch.uint8).cpu().contiguous()).reshape(
                     weights.shape).view(torch.float8_e4m3fn)
         elif tllm_key.endswith("weights_global_scaling_factor"):

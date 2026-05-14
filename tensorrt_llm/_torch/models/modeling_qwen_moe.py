@@ -17,6 +17,7 @@ from ..modules.fused_moe import DefaultMoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..utils import AuxStreamType
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -53,7 +54,7 @@ class QwenMoE(nn.Module):
             routing_method=DefaultMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
-            aux_stream=aux_stream,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
             model_config=model_config,
@@ -65,6 +66,8 @@ class QwenMoE(nn.Module):
             bias=config.mlp_bias if hasattr(config, 'mlp_bias') else False,
             dtype=config.torch_dtype,
             config=model_config,
+            layer_idx=layer_idx,
+            is_shared_expert=True,
         )
 
         self.shared_expert_gate = Linear(self.hidden_dim,
@@ -77,22 +80,24 @@ class QwenMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=False)
 
-        shared_expert_output = self.shared_expert(hidden_states)
+        shared_expert_output = self.shared_expert(
+            hidden_states,
+            lora_params=lora_params,
+        )
         shared_expert_output = F.sigmoid(
             self.shared_expert_gate(hidden_states)) * shared_expert_output
 
@@ -109,10 +114,13 @@ class QwenMoeAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if getattr(config, "rope_scaling", None) is not None:
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_type = None
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+        if rope_type is not None and rope_type != "default":
             pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
+                type=PositionEmbeddingType.from_string(rope_type),
                 rope=RopeParams.from_config(config),
             )
         else:
@@ -162,6 +170,7 @@ class QwenMoeDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -176,13 +185,18 @@ class QwenMoeDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, attn_metadata)
+        hidden_states = self.mlp(
+            hidden_states,
+            attn_metadata,
+            lora_params=lora_params,
+        )
         return hidden_states, residual
 
 
@@ -218,6 +232,7 @@ class QwenMoeModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -235,7 +250,8 @@ class QwenMoeModel(DecoderModel):
             hidden_states, residual = decoder_layer(position_ids=position_ids,
                                                     hidden_states=hidden_states,
                                                     attn_metadata=attn_metadata,
-                                                    residual=residual)
+                                                    residual=residual,
+                                                    lora_params=lora_params)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states

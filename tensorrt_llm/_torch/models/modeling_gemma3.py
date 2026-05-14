@@ -7,6 +7,7 @@ from transformers import Gemma3TextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -14,14 +15,14 @@ from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..utils import inference_mode_unless_compiling
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -47,12 +48,12 @@ class Gemma3TextScaledWordEmbedding(Embedding):
         )
         self.embed_scale = torch.sqrt(torch.tensor(hidden_size)).to(self.dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(self, input_ids):
         return super().forward(input_ids) * self.embed_scale
 
 
-class Gemma3Attention(Attention):
+class Gemma3Attention(QKNormRoPEAttention):
 
     def __init__(
         self,
@@ -65,7 +66,20 @@ class Gemma3Attention(Attention):
         rope_params = RopeParams.from_config(config)
         self.attention_window_size = None
         if is_sliding:
-            rope_params.theta = config.rope_local_base_freq
+            # transformers 5.x moved rope_local_base_freq into
+            # rope_parameters["sliding_attention"]["rope_theta"]
+            local_freq = getattr(config, 'rope_local_base_freq', None)
+            if local_freq is None:
+                rp = getattr(config, 'rope_parameters', None) or {}
+                local_freq = rp.get('sliding_attention', {}).get('rope_theta')
+            if local_freq is None:
+                raise ValueError(
+                    "Gemma3 sliding attention requires a local RoPE base "
+                    "frequency, but neither `config.rope_local_base_freq` "
+                    "(transformers 4.x) nor "
+                    "`config.rope_parameters['sliding_attention']['rope_theta']` "
+                    "(transformers 5.x) is set on the model config.")
+            rope_params.theta = local_freq
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
             self.attention_window_size = config.sliding_window
@@ -82,22 +96,15 @@ class Gemma3Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
+            fuse_qk_norm_rope=False,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
         )
-        self.q_norm = RMSNorm(hidden_size=config.head_dim,
-                              eps=config.rms_norm_eps,
-                              dtype=config.torch_dtype)
-        self.k_norm = RMSNorm(hidden_size=config.head_dim,
-                              eps=config.rms_norm_eps,
-                              dtype=config.torch_dtype)
-        self.aux_stream = torch.cuda.Stream()
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         position_ids: Optional[torch.IntTensor],
@@ -121,36 +128,12 @@ class Gemma3Attention(Attention):
                                attention_mask_data=attention_mask_data,
                                **kwargs)
 
-    def apply_qk_norm(self, q, k):
-
-        def q_l2norm():
-            return self.q_norm(q.reshape(-1, self.head_dim)).reshape(
-                -1, self.q_size)
-
-        def k_l2norm():
-            return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
-                -1, self.kv_size)
-
-        q, k = maybe_execute_in_parallel(
-            q_l2norm,
-            k_l2norm,
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-
-        return q, k
-
-    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
-                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
-        # Gemma3 applies QK norm before RoPE.
-        q, k, v = self.split_qkv(q, k, v)
-        q, k = self.apply_qk_norm(q, k)
-        return super().apply_rope(q, k, v, position_ids)
-
 
 # This function is written to be compatible with TRTLLM's GatedMLP class.
-def pytorch_gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+    if IS_FLASHINFER_AVAILABLE:
+        return torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(gate_x)
+
     gate, x = gate_x.chunk(2, dim=-1)
     return nn.functional.gelu(gate, approximate="tanh") * x
 
@@ -175,7 +158,7 @@ class Gemma3DecoderLayer(DecoderLayer):
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
                             intermediate_size=config.intermediate_size,
                             bias=False,
-                            activation=pytorch_gelu_tanh,
+                            activation=gelu_tanh,
                             dtype=config.torch_dtype,
                             config=model_config,
                             layer_idx=layer_idx)
@@ -194,7 +177,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -253,7 +236,7 @@ class Gemma3TextModel(DecoderModel):
                             eps=config.pretrained_config.rms_norm_eps,
                             dtype=config.pretrained_config.torch_dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -423,7 +406,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             context_mask_list.append(mask_i.flatten())
         return torch.cat(context_mask_list, dim=0).contiguous()
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         attn_metadata: AttentionMetadata,

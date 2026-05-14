@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "refAttention.h"
@@ -45,7 +50,8 @@ using Vector = Matrix<Type, Size, 1>;
 template <typename MathElem, uint32_t tileSize, bool isPaged, bool useBeamSearch>
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize)
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks, float skipSoftmaxThresholdScaleFactor,
+    uint32_t* skippedBlockCount, uint32_t* totalBlockCount, uint32_t multiBlockNum)
 {
     uint32_t const nbTiles = divUp(seqLen, tileSize);
     auto gemm1Acc = Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>::Zero().eval();
@@ -56,6 +62,16 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     float const qkScale = qScale * kvScale / sqrtf(validElemsPerHead);
     uint32_t const seqBeg = (seqLen < slidingWinSize ? 0 : seqLen - slidingWinSize);
     uint32_t const idxTileBeg = seqBeg / tileSize;
+
+    uint32_t const nbSubSeq = (multiBlockNum > 0 && nbTiles >= 2) ? mha::min(nbTiles, multiBlockNum) : 1;
+    std::vector<Eigen::Vector<float, headGrpSize>> skipRowMaxs(nbSubSeq);
+    for (uint32_t i = 0; i < nbSubSeq; i++)
+    {
+        skipRowMaxs[i].fill(-INFINITY);
+    }
+    bool const disableSkipForShortSeq = (seqLen < skipSoftmaxThresholdScaleFactor);
+    float const skipSoftmaxThreshold = disableSkipForShortSeq ? 0.0f : skipSoftmaxThresholdScaleFactor / seqLen;
+
     for (uint32_t idxTile = idxTileBeg; idxTile < nbTiles; idxTile++)
     {
         Eigen::Matrix<float, headGrpSize, tileSize, Eigen::RowMajor> gemm0Acc;
@@ -83,7 +99,22 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
             }
         }
 
-        Eigen::Vector<float, headGrpSize> const tileRowMax = gemm0Acc.rowwise().maxCoeff().cwiseMax(rowMax).eval();
+        Eigen::Vector<float, headGrpSize> const localRowMax = gemm0Acc.rowwise().maxCoeff().eval();
+        Eigen::Vector<float, headGrpSize> const tileRowMax = localRowMax.cwiseMax(rowMax).eval();
+        auto const prevSkipRowMax = skipRowMaxs[idxTile % nbSubSeq];
+        skipRowMaxs[idxTile % nbSubSeq] = localRowMax.cwiseMax(skipRowMaxs[idxTile % nbSubSeq]).eval();
+
+        if (!disableSkipForShortSeq && skipSoftmaxThreshold > 0)
+        {
+            *totalBlockCount += 1;
+            auto const skipSoftmaxMask = ((localRowMax - prevSkipRowMax).array() < std::log(skipSoftmaxThreshold));
+            bool const skipBlock = skipSoftmaxMask.all() && ((idxTile - idxTileBeg) >= nbSubSeq);
+            if (skipBlock)
+            {
+                *skippedBlockCount += 1;
+                continue;
+            }
+        }
 
         Eigen::Matrix<float, headGrpSize, tileSize, Eigen::RowMajor> tileX
             = (gemm0Acc.colwise() - tileRowMax).array().exp().eval();
@@ -113,6 +144,16 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
         }
         rowSum += tileRowSum;
     }
+
+    // Add the attention sinks.
+    if (attentionSinks != nullptr)
+    {
+        for (uint32_t i = 0; i < headGrpSize; i++)
+        {
+            rowSum[i] += expf(attentionSinks[i] - rowMax[i]);
+        }
+    }
+
     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> out
         = gemm1Acc.array().colwise() * (xScale * kvScale / rowSum.array());
     std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(OutputElem(e)); });
@@ -123,7 +164,8 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
     refFlashAttention<prec, tileSize, isPaged, useBeamSearch>(IOHead const* q,                                         \
         CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen,         \
-        float qScale, float kvScale, float xScale, uint32_t slidingWinSize)
+        float qScale, float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks,                     \
+        float skipSoftmaxThreshold, uint32_t* skippedBlockCount, uint32_t* totalBlockCount, uint32_t multiBlockNum)
 
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, false);
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, true);
@@ -143,7 +185,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
 #else
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize)
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks)
 {
 #endif
     float const rcpXScale = 1.f / xScale;
@@ -184,7 +226,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
 
     Eigen::Matrix<float, headGrpSize, Eigen::Dynamic, Eigen::RowMajor> x
         = (gemm0Acc.colwise() - rowMax).array().exp().eval();
-    Eigen::Vector<float, headGrpSize> const rowSum = x.rowwise().sum().eval();
+    Eigen::Vector<float, headGrpSize> rowSum = x.rowwise().sum().eval();
 
     std::for_each(x.data(), x.data() + x.size(), [&](float& e) { e = float(MathElem(e * rcpXScale)); });
 
@@ -200,6 +242,18 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
             }
         }
     }
+
+    // Add the attention sinks.
+#if !SPEC_DEC
+    if (attentionSinks != nullptr)
+    {
+        for (uint32_t i = 0; i < headGrpSize; i++)
+        {
+            rowSum[i] += expf(attentionSinks[i] - rowMax[i]);
+        }
+    }
+#endif
+
     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> out
         = gemm1Acc.array().colwise() * (xScale * kvScale / rowSum.array());
     std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(OutputElem(e)); });
@@ -217,7 +271,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
     refAttention<prec, isPaged, useBeamSearch>(IOHead const* q, CacheSeq<isPaged, useBeamSearch> const& k,             \
         CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale, float kvScale, float xScale,         \
-        uint32_t slidingWinSize)
+        uint32_t slidingWinSize, float* attentionSinks)
 #endif
 INSTANTIATE_refAttention(InputElem, false, false);
 INSTANTIATE_refAttention(InputElem, false, true);

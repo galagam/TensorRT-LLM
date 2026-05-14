@@ -61,7 +61,7 @@ def start_context_server(config,
     """Start a context server on specified GPU and port."""
     cmd = [
         "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--extra_llm_api_options", f"./{CONTEXT_CONFIG_FILE}",
+        str(port), "--config", f"./{CONTEXT_CONFIG_FILE}",
         "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
         "CONTEXT"
     ]
@@ -87,7 +87,7 @@ def start_generation_server(config,
     """Start a generation server on specified GPU and port."""
     cmd = [
         "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--extra_llm_api_options", f"./{GENERATION_CONFIG_FILE}",
+        str(port), "--config", f"./{GENERATION_CONFIG_FILE}",
         "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
         "GENERATION"
     ]
@@ -244,7 +244,7 @@ def create_config_files(config):
     context_config_content = """pytorch_backend_config:
   disable_overlap_scheduler: True
 cache_transceiver_config:
-  backend: "default"
+  backend: "DEFAULT"
   max_tokens_in_buffer: 2048"""
 
     with open(CONTEXT_CONFIG_FILE, 'w') as file:
@@ -252,7 +252,7 @@ cache_transceiver_config:
 
     # Create generation config file
     generation_config_content = """cache_transceiver_config:
-  backend: "default"
+  backend: "DEFAULT"
   max_tokens_in_buffer: 2048"""
 
     with open(GENERATION_CONFIG_FILE, 'w') as file:

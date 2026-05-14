@@ -16,15 +16,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tmaDescriptor.h"
 #include <limits.h>
 #include <stdint.h>
 
-#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+TRTLLM_NAMESPACE_BEGIN
 
-namespace tensorrt_llm
-{
 namespace kernels
 {
 
@@ -68,6 +69,8 @@ enum class ContextAttentionMaskType
     CAUSAL,
     // Causal mask + attend to the specific sliding window or chunk.
     SLIDING_OR_CHUNKED_CAUSAL,
+    // Bidirectional sliding window attention.
+    BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
     CUSTOM_MASK
 };
@@ -81,7 +84,10 @@ enum class AttentionInputLayout
     // Q has contiguous [B, S, H, D] layout, while paged KV has [B, 2, Max_blocks_per_seq] layout
     // that contains paged block indices. The indices indicate the block offset to the pool ptr in
     // global memory
-    Q_PAGED_KV
+    Q_PAGED_KV,
+    // Q has contiguous [B, S, H, D] layout, while K has contiguous [B, S, H_kv, D] layout, and V has
+    // contiguous [B, S, H_kv, D_v] layout. Only used for context MLA now.
+    SEPARATE_Q_K_V,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -115,6 +121,8 @@ struct MHARunnerFixedParams
     int headSize;
     // The head size of V.
     int headSizeV = 0;
+    // The head size of Q/K non-RoPE part, only used for MLA now.
+    int headSizeQkNope = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // The attention logit softcapping scale.
@@ -135,6 +143,10 @@ struct MHARunnerFixedParams
     int sageBlockSizeK = 0;
     // v tensor quant block size in sage attention
     int sageBlockSizeV = 0;
+    // Use sparse MLA ?
+    bool useSparseMLA = false;
+    // Use sparse attention in trtllm-gen ?
+    bool useTllmGenSparseAttention = false;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -166,6 +178,7 @@ struct MHARunnerFixedParams
         case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
+        case AttentionInputLayout::SEPARATE_Q_K_V: output += "separate_q_k_v"; break;
         default: output += std::to_string(static_cast<int>(attentionInputLayout)) + " (unknown)"; break;
         }
 
@@ -184,6 +197,8 @@ struct MHARunnerFixedParams
         output += ", sageBlockSizeQ = " + std::to_string(sageBlockSizeQ);
         output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
         output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
+        output += ", useSparseMLA = " + std::string(useSparseMLA ? "true" : "false");
+        output += ", useTllmGenSparseAttention = " + std::string(useTllmGenSparseAttention ? "true" : "false");
 
         return output;
     }
@@ -255,14 +270,26 @@ struct MHARunnerParams
     void const* qPtr;
     // The contiguous Kv buffer ptr;
     void const* kvPtr;
+    // The K buffer ptr (for separate K input).
+    void const* kPtr;
+    // The V buffer ptr (for separate V input).
+    void const* vPtr;
+    // The V tensor token stride in bytes (0 = compute from head dimensions).
+    // Set this when V's actual stride differs from the default (e.g. contiguous V in AutoDeploy
+    // vs non-contiguous V from kv.split() in PyTorch backend).
+    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
+    // The paged kv cache array for scaling factor.
+    KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
     // The output scaling factor buffer ptr. (only used for FP4 output)
     void* outputSfPtr;
     // The softmax_status ptr for RingAttention.
     void* softmaxStatsPtr;
+    // The attention sinks ptr.
+    float const* attentionSinksPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
@@ -275,6 +302,11 @@ struct MHARunnerParams
     void const* cuMaskRowsPtr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
+    // Scratch buffer (partialO + partialStats) for MultiCtasKv mode in trtllm-gen generation-style kernels.
+    // Only required when the sparse context path selects a GmemReduction cubin; nullptr otherwise.
+    void* multiCtasKvScratchPtr = nullptr;
+    // Per-CTA counter buffer for MultiCtasKv mode synchronization; sized as sizeof(int32_t) * SM count.
+    int32_t* multiCtasKvCounterPtr = nullptr;
     // The bmm1 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).
@@ -293,6 +325,16 @@ struct MHARunnerParams
     int qMaxNBlock;
     int kMaxNBlock;
     int vMaxNBlock;
+    // sparse attention parameters
+    SparseAttentionParams sparse_params;
+
+    // Skip-softmax attention parameters
+    float skipSoftmaxThresholdScaleFactor = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skipSoftmaxTotalBlocks;
+    uint32_t* skipSoftmaxSkippedBlocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -352,6 +394,8 @@ struct Fused_multihead_attention_params_v2
     KVBlockArrayForContextFMHA paged_kv_cache;
     // The mask to implement drop-out.
     void const* packed_mask_ptr;
+    // The attention sinks.
+    float const* attention_sinks_ptr;
     // The O matrix (output).
     void* o_ptr;
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
@@ -436,6 +480,15 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
+
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+    // A positive value means skip-softmax is enabled.
+    float skip_softmax_threshold_scale_factor = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skip_softmax_total_blocks;
+    uint32_t* skip_softmax_skipped_blocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -494,7 +547,10 @@ struct Launch_params
     int sage_block_size_v = 0;
     // if we use a kernel that supports returning softmax statistics
     bool supportReturnSoftmaxStats;
+    // enable skip softmax attention feature
+    bool enableSkipSoftmax = false;
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

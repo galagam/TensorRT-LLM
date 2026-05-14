@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -109,6 +114,12 @@ struct DMA
         SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
+    // Whether use the bidirectional sliding window attention or not.
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+    };
+
     // Is heads interleaved ?
     enum
     {
@@ -196,11 +207,27 @@ struct DMA
             // Skip initial kv tiles due to sliding_window_size
             if (SLIDING_OR_CHUNKED_ATTENTION)
             {
-                // The kv_offset_start.
-                int kv_offset_start = is_chunked_attention
-                    ? ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
-                    : max(0, q_step_offset + 1 - params.sliding_window_size);
-                kv_idx_start = kv_offset_start / STEP_KV;
+                if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+                {
+                    int kv_offset_start = max(0, q_step_offset - params.sliding_window_size / 2);
+                    int kv_offset_end = min(kv_steps * STEP_KV - 1, q_step_end + params.sliding_window_size / 2);
+
+                    // We do floor division plus 1 to get the correct kv_idx_end, this is because kv_idx_end is
+                    // exclusive
+                    kv_idx_start = kv_offset_start / STEP_KV;
+                    kv_idx_end = kv_offset_end / STEP_KV + 1;
+                }
+                else if (is_chunked_attention)
+                {
+                    int kv_offset_start
+                        = ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size);
+                    kv_idx_start = kv_offset_start / STEP_KV;
+                }
+                else
+                {
+                    int kv_offset_start = max(0, q_step_offset + 1 - params.sliding_window_size);
+                    kv_idx_start = kv_offset_start / STEP_KV;
+                }
             }
 
             // Early stop when causal mask is enabled.
@@ -500,7 +527,7 @@ struct DMA
                 int const num_valid_kv_blocks = (actual_kv_seqlen + params.paged_kv_cache.mTokensPerBlock - 1)
                     >> params.paged_kv_cache.mTokensPerBlockLog2;
 
-                for (int q_step_idx = 0; q_step_idx < q_steps; q_step_idx += 2)
+                for (int q_step_idx = 0; q_step_idx < q_steps && actual_kv_seqlen > 0; q_step_idx += 2)
                 {
                     load_q(bidh, q_step_idx * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[0], cbw0);
                     load_q(bidh, (q_step_idx + 1) * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[1], cbw1);
@@ -755,7 +782,7 @@ struct DMA
             for (int kgroup_idx = 0; kgroup_idx < Kernel_traits::BMM2_K_GROUPS; kgroup_idx++)
             {
 #pragma unroll
-                for (int dgroup_idx = 0; dgroup_idx < Kernel_traits::D_GROUPS; dgroup_idx++)
+                for (int dgroup_idx = 0; dgroup_idx < Kernel_traits::DV_GROUPS; dgroup_idx++)
                 {
                     // Src smem block is k first then d
                     uint32_t src_offset = (kgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::D_PER_GROUP
@@ -764,7 +791,7 @@ struct DMA
 
                     // Dst smem block is d first then k
                     uint32_t dst_offset = (dgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::D_PER_GROUP
-                                              + kgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::D)
+                                              + kgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::DV)
                         * Kernel_traits::ELEMENT_BYTES;
 
                     transposer.template transpose_<false>(smem_v_src + src_offset, smem_v_dst + dst_offset);

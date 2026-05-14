@@ -4,7 +4,7 @@
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
-    TensorRT-LLM OpenAI API server
+    TensorRT LLM OpenAI API server
     trtllm-serve <your_model>
 
 On the client side, run:
@@ -12,7 +12,7 @@ On the client side, run:
         --model <your_model> \
         --dataset-name sharegpt \
         --dataset-path <path to dataset> \
-        --request-rate <request_rate> \ # By default <request_rate> is inf
+        --request-rate <request_rate> # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
 
 """
@@ -41,10 +41,11 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
     RequestFuncInput, RequestFuncOutput, get_tokenizer)
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
-    HuggingFaceDataset, InstructCoderDataset, RandomDataset, SampleRequest,
-    ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+    HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
+    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
+from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -79,11 +80,17 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
-    # Request accuracy rate metrics
-    mean_request_ar: float
-    median_request_ar: float
-    std_request_ar: float
-    percentiles_request_ar: list[tuple[float, float]]
+    # Energy metrics
+    total_energy_j: Optional[float]
+    output_tps_per_w: Optional[float]
+    total_gpu_power_w: Optional[float]
+    # Statistics for avg_decoded_tokens_per_iter across all requests
+    mean_avg_decoded_tokens_per_iter: float
+    min_avg_decoded_tokens_per_iter: float
+    max_avg_decoded_tokens_per_iter: float
+    median_avg_decoded_tokens_per_iter: float
+    std_avg_decoded_tokens_per_iter: float
+    percentiles_avg_decoded_tokens_per_iter: list[tuple[float, float]]
 
 
 async def get_request(
@@ -136,7 +143,9 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int], list[float]]:
+    total_energy: Optional[float] = None,
+    total_energy_query_time: Optional[float] = None,
+) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -147,8 +156,13 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
-    request_ars: list[float] = []  # Request accuracy rates
+    avg_decoded_tokens_per_iter_list: list[float] = []
+    error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
+        if outputs[i].exception_type:
+            exception_type = outputs[i].exception_type
+            error_counts[exception_type] = error_counts.get(exception_type,
+                                                            0) + 1
         if outputs[i].success:
             output_len = outputs[i].output_tokens
             if not output_len:
@@ -173,24 +187,20 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
-
-            # Calculate request accuracy rate (num_generated_tokens / (decode_iteration + 1))
-            decode_iter = outputs[i].decode_iteration
-            if decode_iter >= 0:
-                # For generated tokens, we use output_len - 1 (excluding the first token if needed)
-                # But according to the reference, it should be num_generated_tokens
-                num_generated_tokens = max(0, output_len -
-                                           1) if output_len > 1 else output_len
-                request_ar = num_generated_tokens / (
-                    decode_iter + 1) if decode_iter >= 0 else 0.0
-                request_ars.append(request_ar)
-            else:
-                request_ars.append(0.0)
-
             completed += 1
+
+            # Collect avg_decoded_tokens_per_iter for all requests
+            if hasattr(outputs[i], 'avg_decoded_tokens_per_iter'
+                       ) and outputs[i].avg_decoded_tokens_per_iter is not None:
+                avg_decoded_tokens_per_iter_list.append(
+                    outputs[i].avg_decoded_tokens_per_iter)
         else:
             actual_output_lens.append(0)
-            request_ars.append(0.0)
+
+    total_error_count = sum(error_counts.values())
+    for exception_type, count in error_counts.items():
+        print(f"Error type: {exception_type}, Count: {count} requests")
+    print(f"Total failed requests: {total_error_count}")
 
     if goodput_config_dict:
         valid_metrics = []
@@ -219,6 +229,16 @@ def calculate_metrics(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
             stacklevel=2)
+
+    # Compute energy-derived metrics
+    total_output_tokens = sum(actual_output_lens)
+    if total_energy is not None and total_energy > 0:
+        output_tps_per_w = total_output_tokens / total_energy
+        total_gpu_power_w = total_energy / total_energy_query_time if total_energy_query_time > 0 else 0.0
+    else:
+        output_tps_per_w = None
+        total_gpu_power_w = None
+
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -249,13 +269,25 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
-        mean_request_ar=np.mean(request_ars or 0),
-        median_request_ar=np.median(request_ars or 0),
-        std_request_ar=np.std(request_ars or 0),
-        percentiles_request_ar=[(p, np.percentile(request_ars or 0, p))
-                                for p in selected_percentiles],
+        total_energy_j=total_energy,
+        output_tps_per_w=output_tps_per_w,
+        total_gpu_power_w=total_gpu_power_w,
+        mean_avg_decoded_tokens_per_iter=np.mean(
+            avg_decoded_tokens_per_iter_list or 0),
+        min_avg_decoded_tokens_per_iter=np.min(avg_decoded_tokens_per_iter_list)
+        if avg_decoded_tokens_per_iter_list else 0.0,
+        max_avg_decoded_tokens_per_iter=np.max(avg_decoded_tokens_per_iter_list)
+        if avg_decoded_tokens_per_iter_list else 0.0,
+        median_avg_decoded_tokens_per_iter=np.median(
+            avg_decoded_tokens_per_iter_list or 0),
+        std_avg_decoded_tokens_per_iter=np.std(avg_decoded_tokens_per_iter_list
+                                               or 0),
+        percentiles_avg_decoded_tokens_per_iter=[
+            (p, np.percentile(avg_decoded_tokens_per_iter_list or 0, p))
+            for p in selected_percentiles
+        ],
     )
-    return metrics, actual_output_lens, request_ars
+    return metrics, actual_output_lens
 
 
 async def benchmark(
@@ -288,10 +320,13 @@ async def benchmark(
 
     if not no_test_input:
         print("Starting initial single prompt test run...")
-        test_prompt, test_prompt_len, test_output_len = \
+        test_prompt, test_prompt_len, test_output_len, test_mm_content = \
             input_requests[0].prompt, input_requests[0].prompt_len, \
-            input_requests[0].expected_output_len
+            input_requests[0].expected_output_len, input_requests[0].multi_modal_data
 
+        assert test_mm_content is None or isinstance(
+            test_mm_content, list) and all(
+                isinstance(item, dict) for item in test_mm_content)
         test_input = RequestFuncInput(
             model=model_id,
             model_name=model_name,
@@ -302,6 +337,7 @@ async def benchmark(
             logprobs=logprobs,
             ignore_eos=ignore_eos,
             extra_body=extra_body,
+            multi_modal_content=test_mm_content,
         )
 
         test_output = await request_func(request_func_input=test_input,
@@ -323,15 +359,18 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                         model_name=model_name,
-                                         prompt=test_prompt,
-                                         api_url=base_url + "/start_profile",
-                                         prompt_len=test_prompt_len,
-                                         output_len=test_output_len,
-                                         logprobs=logprobs,
-                                         ignore_eos=ignore_eos,
-                                         extra_body=extra_body)
+        profile_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=base_url + "/start_profile",
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+            multi_modal_content=test_mm_content,
+        )
         profile_output = await request_func(request_func_input=profile_input,
                                             streaming=streaming)
         if profile_output.success:
@@ -346,7 +385,8 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests),
+                                          desc="Benchmarking")
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
@@ -368,6 +408,9 @@ async def benchmark(
                                       pbar=pbar,
                                       session=session)
 
+    # Query energy metrics before benchmark
+    energy_start = await fetch_energy_metrics(base_url)
+
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     session = aiohttp.ClientSession(trust_env=True,
@@ -379,23 +422,26 @@ async def benchmark(
 
     i = 0
     async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len = request.prompt, \
-            request.prompt_len, request.expected_output_len
+        prompt, prompt_len, output_len, mm_content = request.prompt, \
+            request.prompt_len, request.expected_output_len, request.multi_modal_data
 
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
-        request_func_input = RequestFuncInput(model=req_model_id,
-                                              model_name=req_model_name,
-                                              prompt=prompt,
-                                              api_url=api_url,
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
-                                              logprobs=logprobs,
-                                              ignore_eos=ignore_eos,
-                                              extra_body=extra_body)
+        request_func_input = RequestFuncInput(
+            model=req_model_id,
+            model_name=req_model_name,
+            prompt=prompt,
+            api_url=api_url,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+            multi_modal_content=mm_content,
+        )
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -426,10 +472,23 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    # Query energy metrics after benchmark
+    energy_end = await fetch_energy_metrics(base_url)
+
     # Close the session
     await session.close()
 
-    metrics, actual_output_lens, request_ars = calculate_metrics(
+    # Compute energy delta for this benchmark run
+    total_energy, total_energy_query_time = None, None
+    if (energy_start is not None and energy_end is not None
+            and "total_energy_j" in energy_start
+            and "total_energy_j" in energy_end):
+        total_energy = (energy_end["total_energy_j"] -
+                        energy_start["total_energy_j"])
+        total_energy_query_time = energy_end["query_time"] - energy_start[
+            "query_time"]
+
+    metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -437,10 +496,15 @@ async def benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
+        total_energy=total_energy,
+        total_energy_query_time=total_energy_query_time,
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
+    print("{:<40} {:<10}".format("Total requests:", len(outputs)))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10}".format("Failed requests:",
+                                 len(outputs) - metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
                                     benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
@@ -457,10 +521,13 @@ async def benchmark(
                                     metrics.total_token_throughput))
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
-    print("{:<40} {:<10.4f}".format("Mean Request AR:",
-                                    metrics.mean_request_ar))
-    print("{:<40} {:<10.4f}".format("Median Request AR:",
-                                    metrics.median_request_ar))
+
+    if len(outputs) - metrics.completed > 0:
+        print(
+            f"=======================!FAILED REQUESTS!=======================")
+        print(f"Total failed requests: {len(outputs) - metrics.completed}")
+        print(
+            f"=====================!CHECK LOG FOR ERRORS!====================")
 
     result = {
         "duration": benchmark_duration,
@@ -473,18 +540,32 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
-        "mean_request_ar": metrics.mean_request_ar,
-        "median_request_ar": metrics.median_request_ar,
-        "std_request_ar": metrics.std_request_ar,
+        "avg_decoded_tokens_per_iter": {
+            "mean": metrics.mean_avg_decoded_tokens_per_iter,
+            "min": metrics.min_avg_decoded_tokens_per_iter,
+            "max": metrics.max_avg_decoded_tokens_per_iter,
+            "median": metrics.median_avg_decoded_tokens_per_iter,
+            "std": metrics.std_avg_decoded_tokens_per_iter,
+            "percentiles": {
+                f"p{p}": v
+                for p, v in metrics.percentiles_avg_decoded_tokens_per_iter
+            }
+        },
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
+        "e2els": [output.latency for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
-        "request_ars": request_ars,
-        "decode_iterations": [output.decode_iteration for output in outputs],
     }
+
+    if metrics.total_energy_j is not None:
+        result["energy"] = {
+            "total_energy_j": metrics.total_energy_j,
+            "output_tps_per_w": metrics.output_tps_per_w,
+            "total_gpu_power_w": metrics.total_gpu_power_w,
+        }
 
     def process_one_metric(
         # E.g., "ttft"
@@ -493,36 +574,80 @@ async def benchmark(
         metric_name: str,
         # E.g., "Time to First Token"
         metric_header: str,
+        # E.g., "ms" or "" for no unit
+        unit_suffix: str = "ms",
     ):
-        # This function prints and adds statistics of the specified
-        # metric.
-        if metric_attribute_name not in selected_percentile_metrics:
+        # This function prints and adds statistics of the specified metric.
+        # Skip if not in selected metrics (except avg_decoded_tokens_per_iter which has its own condition)
+        if (metric_attribute_name not in selected_percentile_metrics
+                and metric_attribute_name != "avg_decoded_tokens_per_iter"):
             return
+
+        # Build attribute suffix (e.g., "_ms" or "")
+        attr_suffix = f"_{unit_suffix}" if unit_suffix else ""
+        # Build display unit (e.g., " (ms)" or "")
+        display_unit = f" ({unit_suffix})" if unit_suffix else ""
+
         print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
         print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
+            f"Mean {metric_name}{display_unit}:",
+            getattr(metrics, f"mean_{metric_attribute_name}{attr_suffix}")))
         print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
-        result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
-        result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
-        result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
+            f"Median {metric_name}{display_unit}:",
+            getattr(metrics, f"median_{metric_attribute_name}{attr_suffix}")))
+        if hasattr(metrics, f"std_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Std Dev {metric_name}{display_unit}:",
+                getattr(metrics, f"std_{metric_attribute_name}{attr_suffix}")))
+            result[f"std_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"std_{metric_attribute_name}{attr_suffix}")
+        if hasattr(metrics, f"min_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Min {metric_name}{display_unit}:",
+                getattr(metrics, f"min_{metric_attribute_name}{attr_suffix}")))
+            result[f"min_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"min_{metric_attribute_name}{attr_suffix}")
+        if hasattr(metrics, f"max_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Max {metric_name}{display_unit}:",
+                getattr(metrics, f"max_{metric_attribute_name}{attr_suffix}")))
+            result[f"max_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"max_{metric_attribute_name}{attr_suffix}")
+
+        result[f"mean_{metric_attribute_name}{attr_suffix}"] = getattr(
+            metrics, f"mean_{metric_attribute_name}{attr_suffix}")
+        result[f"median_{metric_attribute_name}{attr_suffix}"] = getattr(
+            metrics, f"median_{metric_attribute_name}{attr_suffix}")
+
+        for p, value in getattr(
+                metrics, f"percentiles_{metric_attribute_name}{attr_suffix}"):
             p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
-            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+            print("{:<40} {:<10.2f}".format(
+                f"P{p_word} {metric_name}{display_unit}:", value))
+            result[f"p{p_word}_{metric_attribute_name}{attr_suffix}"] = value
+
+    # Print avg_decoded_tokens_per_iter statistics if available
+    if metrics.mean_avg_decoded_tokens_per_iter > 0.0:
+        process_one_metric("avg_decoded_tokens_per_iter",
+                           "Avg Decoded Tokens per Iter",
+                           "Avg Decoded Tokens per Iter",
+                           unit_suffix="")
 
     process_one_metric("ttft", "TTFT", "Time to First Token")
     process_one_metric("tpot", "TPOT",
                        "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+
+    if metrics.total_energy_j is not None:
+        print("{s:{c}^{n}}".format(s=' Energy Metrics ', n=50, c='-'))
+        print("{:<40} {:<10.4f}".format("Total Energy (J):",
+                                        metrics.total_energy_j))
+        print("{:<40} {:<10.4f}".format(
+            "Output Tokens per Second per Watt (tps/W):",
+            metrics.output_tps_per_w))
+        print("{:<40} {:<10.4f}".format("Total GPU Power (W):",
+                                        metrics.total_gpu_power_w))
 
     print("=" * 50)
 
@@ -569,19 +694,15 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     metrics = [
         "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
         "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms",
-        "mean_request_ar", "median_request_ar", "std_request_ar"
+        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = [
-        "ttfts", "itls", "generated_texts", "errors", "request_ars",
-        "decode_iterations"
-    ]
+    ignored_metrics = ["ttfts", "itls", "e2els", "generated_texts", "errors"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]]
-                 for k in metrics},
+                 for k in metrics if k in results},
         extra_info={
             k: results[k]
             for k in results if k not in metrics and k not in ignored_metrics
@@ -590,6 +711,57 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         # Don't use json suffix here as we don't want CI to pick it up
         pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
         write_to_json(pt_file, pt_records)
+
+
+async def fetch_energy_metrics(base_url: str) -> Optional[dict]:
+    """Fetch energy metrics from the /energy_metrics endpoint.
+
+    Args:
+        base_url: The base URL of the server.
+
+    Returns:
+        Dictionary containing energy metrics, or None if unavailable.
+    """
+    energy_url = f"{base_url}/energy_metrics"
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(energy_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return None
+        except Exception:
+            return None
+
+
+async def fetch_perf_metrics(base_url: str) -> dict:
+    """
+    Fetch performance metrics from the /perf_metrics endpoint.
+
+    Args:
+        base_url: The base URL of the server
+
+    Returns:
+        Dictionary containing the performance metrics
+    """
+    perf_url = f"{base_url}/perf_metrics"
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(perf_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    print(
+                        f"Failed to fetch performance metrics. Status: {response.status}"
+                    )
+                    return {}
+        except Exception as e:
+            print(f"Error fetching performance metrics: {e}")
+            return {}
 
 
 def main(args: argparse.Namespace):
@@ -603,6 +775,9 @@ def main(args: argparse.Namespace):
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
 
+    if backend == "openai-chat":
+        args.endpoint = "/v1/chat/completions"
+
     if args.base_url is not None:
         api_url = f"{args.base_url}{args.endpoint}"
         base_url = f"{args.base_url}"
@@ -612,7 +787,9 @@ def main(args: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id,
                               tokenizer_mode=tokenizer_mode,
-                              trust_remote_code=args.trust_remote_code)
+                              trust_remote_code=args.trust_remote_code,
+                              custom_tokenizer=getattr(args, 'custom_tokenizer',
+                                                       None))
 
     if args.dataset_name is None:
         raise ValueError(
@@ -665,6 +842,13 @@ def main(args: argparse.Namespace):
                 f" from one of following: {supported_datasets}. "
                 "Please consider contributing if you would "
                 "like to add support for additional dataset formats.")
+        if dataset_class.IS_MULTIMODAL and backend not in [
+                "openai-chat",
+        ]:
+            # multi-modal benchmark is only available on OpenAI Chat backend.
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' backend."
+            )
         input_requests = dataset_class(
             dataset_path=args.dataset_path,
             dataset_subset=args.hf_subset,
@@ -684,41 +868,78 @@ def main(args: argparse.Namespace):
                                        )
 
     else:
-        # For datasets that follow a similar structure, use a mapping.
-        dataset_mapping = {
-            "sharegpt":
-            lambda: ShareGPTDataset(download_path=args.download_path,
-                                    download_timeout=args.download_timeout,
-                                    random_seed=args.seed,
-                                    dataset_path=args.dataset_path).sample(
-                                        tokenizer=tokenizer,
-                                        num_requests=args.num_prompts,
-                                        output_len=args.sharegpt_output_len,
-                                    ),
-            "burstgpt":
-            lambda: BurstGPTDataset(random_seed=args.seed,
-                                    dataset_path=args.dataset_path).
-            sample(tokenizer=tokenizer, num_requests=args.num_prompts),
-            "random":
-            lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
-                                  return_text=not args.tokenize_on_client,
-                                  dataset_path=args.dataset_path,
-                                  download_path=args.download_path,
-                                  download_timeout=args.download_timeout
-                                  ).sample(
-                                      tokenizer=tokenizer,
-                                      num_requests=args.num_prompts,
-                                      prefix_len=args.random_prefix_len,
-                                      input_len=args.random_input_len,
-                                      output_len=args.random_output_len,
-                                      range_ratio=args.random_range_ratio,
-                                  )
+
+        def create_dataset_and_sample(dataset_name: str):
+            """Factory function to create dataset instance and generate samples."""
+
+            # Dataset factory mapping with lambda functions for lazy evaluation
+            dataset_factories = {
+                "sharegpt":
+                lambda: ShareGPTDataset(download_path=args.download_path,
+                                        download_timeout=args.download_timeout,
+                                        random_seed=args.seed,
+                                        dataset_path=args.dataset_path).
+                sample(tokenizer=tokenizer,
+                       num_requests=args.num_prompts,
+                       output_len=args.sharegpt_output_len),
+                "burstgpt":
+                lambda: BurstGPTDataset(random_seed=args.seed,
+                                        dataset_path=args.dataset_path).
+                sample(tokenizer=tokenizer, num_requests=args.num_prompts),
+                "random":
+                lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
+                                      return_text=not args.tokenize_on_client,
+                                      dataset_path=args.dataset_path,
+                                      download_path=args.download_path,
+                                      download_timeout=args.download_timeout,
+                                      random_seed=args.seed).sample(
+                                          tokenizer=tokenizer,
+                                          num_requests=args.num_prompts,
+                                          prefix_len=args.random_prefix_len,
+                                          input_len=args.random_input_len,
+                                          output_len=args.random_output_len,
+                                          range_ratio=args.random_range_ratio),
+                "random_image":
+                lambda: RandomImageDataset(
+                    random_seed=args.seed,
+                    return_text=not args.tokenize_on_client,
+                ).sample(tokenizer=tokenizer,
+                         num_requests=args.num_prompts,
+                         prefix_len=args.random_prefix_len,
+                         input_len=args.random_input_len,
+                         output_len=args.random_output_len,
+                         range_ratio=args.random_range_ratio,
+                         width=args.random_image_width,
+                         height=args.random_image_height,
+                         image_size=args.random_image_size,
+                         num_images=args.random_num_images),
+            }
+
+            if dataset_name not in dataset_factories:
+                raise ValueError(
+                    f"Unknown dataset: {dataset_name}. "
+                    f"Available datasets: {list(dataset_factories.keys())}")
+
+            return dataset_factories[dataset_name]()
+
+        # Check multimodal compatibility before creating dataset
+        dataset_class_mapping = {
+            "sharegpt": ShareGPTDataset,
+            "burstgpt": BurstGPTDataset,
+            "random": RandomDataset,
+            "random_image": RandomImageDataset,
         }
 
-        try:
-            input_requests = dataset_mapping[args.dataset_name]()
-        except KeyError as err:
-            raise ValueError(f"Unknown dataset: {args.dataset_name}") from err
+        dataset_class = dataset_class_mapping.get(args.dataset_name)
+        if dataset_class and dataset_class.IS_MULTIMODAL and backend not in [
+                "openai-chat"
+        ]:
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' backend."
+            )
+
+        # Create dataset and generate samples
+        input_requests = create_dataset_and_sample(args.dataset_name)
     goodput_config_dict = check_goodput_args(args)
 
     # Collect the sampling parameters.
@@ -741,9 +962,8 @@ def main(args: argparse.Namespace):
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
 
-    # Avoid GC processing "static" data - reduce pause times.
-    gc.collect()
-    gc.freeze()
+    # Avoid GC - reduce pause times.
+    gc.disable()
 
     benchmark_result = asyncio.run(
         benchmark(
@@ -800,9 +1020,8 @@ def main(args: argparse.Namespace):
         if not args.save_detailed:
             # Remove fields with too many data points
             for field in [
-                    "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors", "request_ars",
-                    "decode_iterations"
+                    "input_lens", "output_lens", "ttfts", "itls", "e2els",
+                    "generated_texts", "errors"
             ]:
                 if field in result_json:
                     del result_json[field]
@@ -825,6 +1044,55 @@ def main(args: argparse.Namespace):
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
+
+    # Save per-request breakdown if requested
+    if args.save_request_time_breakdown:
+        print("Fetching request performance metrics...")
+        perf_metrics = asyncio.run(fetch_perf_metrics(base_url))
+
+        if perf_metrics:
+            # Generate filename for perf metrics
+            current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+            base_model_id = model_id.split("/")[-1]
+            max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                                   if args.max_concurrency is not None else "")
+            perf_filename = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}-perf_metrics.json"
+
+            if args.result_dir:
+                perf_filename = os.path.join(args.result_dir, perf_filename)
+
+            # Save perf metrics to JSON file
+            with open(perf_filename, "w", encoding='utf-8') as outfile:
+                try:
+                    json.dump(perf_metrics, outfile, indent=2)
+                except Exception as e:
+                    print(f"Failed to save perf metrics: {e}")
+
+            print(f"Request performance metrics saved to: {perf_filename}")
+
+            # Create timing diagram from the saved JSON file
+            try:
+                analyzer = RequestTimeBreakdown()
+
+                print("Creating time diagram from request time breakdown...")
+                timing_data = analyzer.parse_json_file(perf_filename)
+
+                if timing_data:
+                    # Generate HTML filename for the timing diagram
+                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-time_diagram.html"
+                    analyzer.create_timing_diagram(timing_data,
+                                                   diagram_filename)
+
+                    print(f"Time diagram saved to: {diagram_filename}")
+                else:
+                    print(
+                        "No time data found in request time breakdown - skipping diagram creation."
+                    )
+            except Exception as e:
+                print(f"Failed to create time diagram: {e}")
+                print("Performance metrics were still saved successfully.")
+        else:
+            print("Failed to fetch per-request performance metrics.")
 
 
 if __name__ == "__main__":
@@ -856,7 +1124,8 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
-            "sharegpt", "burstgpt", "sonnet", "random", "hf", "trtllm_custom"
+            "sharegpt", "burstgpt", "sonnet", "random", "random_image", "hf",
+            "trtllm_custom"
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -950,6 +1219,14 @@ if __name__ == "__main__":
         help="Trust remote code from huggingface",
     )
     parser.add_argument(
+        "--custom-tokenizer",
+        type=str,
+        default=None,
+        help="Custom tokenizer alias (e.g., 'deepseek_v32') or "
+        "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+        "is incompatible with AutoTokenizer.",
+    )
+    parser.add_argument(
         "--disable-tqdm",
         action="store_true",
         help="Specify to disable tqdm progress bar.",
@@ -1003,11 +1280,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl,request_ar",
+        default="ttft,tpot,itl",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", \"request_ar\". "
-        "Default value is \"ttft,tpot,itl,request_ar\".")
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
+        "Default value is \"ttft,tpot,itl\".")
     parser.add_argument(
         "--metric-percentiles",
         type=str,
@@ -1106,6 +1383,32 @@ if __name__ == "__main__":
         help=
         "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
     )
+    random_image_group = parser.add_argument_group(
+        "random image dataset options")
+    random_image_group.add_argument(
+        "--random-image-width",
+        type=int,
+        default=512,
+        help="Width of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-image-height",
+        type=int,
+        default=512,
+        help="Height of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-image-size",
+        type=int,
+        default=512,
+        help="Squared size of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-num-images",
+        type=int,
+        default=1,
+        help="Number of images per request.",
+    )
 
     hf_group = parser.add_argument_group("hf dataset options")
     hf_group.add_argument("--hf-subset",
@@ -1180,6 +1483,13 @@ if __name__ == "__main__":
         "--no-test-input",
         action="store_true",
         help="Skip initial test run with a single prompt.",
+    )
+
+    parser.add_argument(
+        "--save-request-time-breakdown",
+        action="store_true",
+        help=
+        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
     )
 
     args = parser.parse_args()

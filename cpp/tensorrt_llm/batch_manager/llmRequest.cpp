@@ -69,8 +69,9 @@ void LlmRequest::createSerializedResult(
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
 std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
 {
-    TLLM_CHECK(!isDisaggContextCompleteState());
-    if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
+    auto const streamingInProgress = mIsStreaming
+        && (mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE);
+    if (!(isFinished() || streamingInProgress))
     {
         return std::nullopt;
     }
@@ -88,7 +89,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     auto const maxNbTokens = getMaxBeamNumTokens();
 
-    if (isDisaggContextTransmissionState() && isContextOnlyRequest())
+    if ((isDisaggContextTransmissionState() || isDisaggContextCompleteState()) && isContextOnlyRequest())
     {
         auto const reqBeamWidth = mSamplingConfig.beamWidth;
         std::vector<TokenIdType> firstGenTokens;
@@ -98,13 +99,15 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
         }
         if (!hasDraftTokens())
         {
-            result.contextPhaseParams = executor::ContextPhaseParams{
-                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), std::nullopt};
+            result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
+                mContextPhaseParams.value().releaseState(), std::nullopt, mContextPhaseParams.value().getCtxDpRank(),
+                mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
         else
         {
-            result.contextPhaseParams = executor::ContextPhaseParams{
-                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), *getDraftTokens()};
+            result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
+                mContextPhaseParams.value().releaseState(), *getDraftTokens(),
+                mContextPhaseParams.value().getCtxDpRank(), mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
     }
 
@@ -200,6 +203,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     result.finishReasons = sliceBeams(mFinishReasons);
     result.decodingIter = mDecodingIter;
+    result.avgDecodedTokensPerIter = getAvgDecodedTokensPerIter();
 
     if (hasAdditionalOutputs())
     {
@@ -220,6 +224,21 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
     return result;
+}
+
+bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
+{
+    TLLM_CHECK_WITH_INFO(!isContextFinished(), "not supported after prefill");
+
+    if (mSamplingConfig.beamWidth == 0)
+    {
+        return true;
+    }
+
+    // Before generation, all beams contain the same tokens
+    auto const& tokens = getTokens(0);
+    return std::all_of(
+        tokens.begin(), tokens.end(), [&vocabSize](auto const& token) { return token >= 0 && token < vocabSize; });
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
@@ -348,6 +367,12 @@ void LlmRequest::moveLoraWeightsToGpu(runtime::BufferManager const& manager)
     // TODO for tp / pp models we only need to move the bit that belong on the local device
     TensorPtr gpuLoraWeights = manager.copyFrom(*mLoraWeights.value(), runtime::MemoryType::kGPU);
     mLoraWeights = gpuLoraWeights;
+}
+
+void LlmRequest::removeLoraTensors()
+{
+    mLoraWeights.reset();
+    mLoraConfig.reset();
 }
 
 } // namespace tensorrt_llm::batch_manager

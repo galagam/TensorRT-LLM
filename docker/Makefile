@@ -1,6 +1,8 @@
 # Default base image for the docker build as defined in Dockerfile.multi
 BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+TRITON_IMAGE       ?= $(shell grep '^ARG TRITON_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+TRITON_BASE_TAG    ?= $(shell grep '^ARG TRITON_BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 # Name of the new image
 IMAGE_NAME         ?= tensorrt_llm
 IMAGE_TAG          ?= latest
@@ -73,13 +75,23 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
+base_pull:
+	@echo "Pulling base image: $(BASE_IMAGE):$(BASE_TAG)"
+	docker pull $(BASE_IMAGE):$(BASE_TAG)
+
 %_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE))
-%_build:
+%_build: SH_ENV      = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+				  	   | grep '^ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: BASH_ENV    = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+    				   | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: base_pull
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
+		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
+		$(if $(TRITON_BASE_TAG), --build-arg TRITON_BASE_TAG=$(TRITON_BASE_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
@@ -93,6 +105,8 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
+		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
@@ -133,7 +147,7 @@ CODE_DIR          ?= /code/tensorrt_llm
 EXTRA_VOLUMES     ?=
 CCACHE_DIR        ?= $(CODE_DIR)/cpp/.ccache
 CONAN_DIR         ?= $(CODE_DIR)/cpp/.conan
-USER_CACHE_DIR    ?= $(HOME_DIR)/.cache
+USER_CACHE_DIR    ?= $(shell readlink -f "${HOME_DIR}/.cache")
 RUN_CMD           ?=
 CONTAINER_NAME    ?= tensorrt_llm
 WORK_DIR          ?= $(CODE_DIR)
@@ -187,17 +201,22 @@ jenkins-aarch64_%: STAGE = tritondevel
 jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_VERSION}),PY312,$(if $(findstring 3.10,${PYTHON_VERSION}),PY310,$(error Unknown PYTHON_VERSION specified)))
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
-jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
+jenkins-rockylinux8_%: BASE_TAG = 13.1.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
-rockylinux8_%: BASE_IMAGE = nvidia/cuda
-rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
+rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
+rockylinux8_%: BASE_TAG = 13.1.1-devel-rockylinux8
+
+# For x86_64
+ubuntu22_%: STAGE = tritondevel
+ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
+ubuntu22_%: BASE_TAG = 13.1.1-devel-ubuntu22.04
 
 # For x86_64 and aarch64
-ubuntu22_%: STAGE = tritondevel
-ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.9.1-devel-ubuntu22.04
+ubuntu24_%: STAGE = tritondevel
+ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
+ubuntu24_%: BASE_TAG = 13.1.1-devel-ubuntu24.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

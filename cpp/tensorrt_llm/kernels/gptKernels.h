@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
@@ -22,8 +23,8 @@
 #include <cuda_runtime.h>
 #include <sstream>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -144,8 +145,10 @@ struct BuildDecoderInfoParams
 
     // Scales for fmha only.
     // The scale to dequant Q/Kv input.
-    float const* dequantScaleQ;
-    float const* dequantScaleKv;
+    float const* dequantScaleQkv;
+    // Whether to use separate scales for Q/K/V.
+    bool separateQkvScales;
+
     // The scale to quant O output.
     float const* quantScaleO;
     // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
@@ -220,29 +223,23 @@ struct BuildDecoderInfoParams
     std::string toString() const
     {
         std::stringstream ss;
+        auto printTensor = [&ss](char const* name, void* ptr, nvinfer1::Dims shape)
+        {
+            ss << name << ": ";
+            if (ptr)
+                ss << *(runtime::ITensor::wrap((void*) ptr, nvinfer1::DataType::kINT32, shape));
+            else
+                ss << "nullptr";
+            ss << std::endl;
+        };
         ss << "BuildDecoderInfoParams ====================" << std::endl;
-        ss << "seqQOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seqQOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "seqKVOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seqKVOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "paddingOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "tokensInfo: "
-           << *(runtime::ITensor::wrap(
-                  (void*) tokensInfo, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({numTokens * 2})))
-           << std::endl;
+        printTensor("seqQOffsets", seqQOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("seqKVOffsets", seqKVOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("paddingOffsets", paddingOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("tokensInfo", tokensInfo, runtime::ITensor::makeShape({numTokens * 2}));
         if (encoderPaddingOffsets != nullptr)
         {
-            ss << "encoderPaddingOffsets: "
-               << *(runtime::ITensor::wrap((void*) encoderPaddingOffsets, nvinfer1::DataType::kINT32,
-                      runtime::ITensor::makeShape({batchSize})))
-               << std::endl;
+            printTensor("encoderPaddingOffsets", encoderPaddingOffsets, runtime::ITensor::makeShape({batchSize}));
         }
         ss << "attentionMask: " << static_cast<void*>(attentionMask) << std::endl;
         ss << "seqQLengths: " << seqQLengths << std::endl;
@@ -273,4 +270,5 @@ template <typename T>
 void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

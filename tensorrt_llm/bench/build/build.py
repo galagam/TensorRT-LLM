@@ -1,12 +1,11 @@
 from __future__ import annotations
-from transformers import AutoConfig
 
 from pathlib import Path
 from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
 
-from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
@@ -15,15 +14,15 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig, Qwen3HybridConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
 
 TUNED_QUANTS = {
     QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.NO_QUANT, None
 }
-DEFAULT_MAX_BATCH_SIZE = BuildConfig.max_batch_size
-DEFAULT_MAX_NUM_TOKENS = BuildConfig.max_num_tokens
+DEFAULT_MAX_BATCH_SIZE = BuildConfig.model_fields["max_batch_size"].default
+DEFAULT_MAX_NUM_TOKENS = BuildConfig.model_fields["max_num_tokens"].default
 
 
 def get_benchmark_engine_settings(
@@ -86,10 +85,12 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     Raises:
         ValueError: When model is not supported.
     """
-    if is_nemotron_hybrid(
-            AutoConfig.from_pretrained(model_path or model_name,
-                                       trust_remote_code=True)):
+    pretrained_config = load_pretrained_config(model_path or model_name,
+                                               trust_remote_code=True)
+    if is_nemotron_hybrid(pretrained_config):
         return NemotronHybridConfig.from_hf(model_name, model_path)
+    if is_qwen3_hybrid(pretrained_config):
+        return Qwen3HybridConfig.from_hf(model_name, model_path)
     return ModelConfig.from_hf(model_name, model_path)
 
 
@@ -131,7 +132,7 @@ def apply_build_mode_settings(params):
 
 @click.command(name="build")
 @optgroup.group("Engine Configuration",
-                help="Configuration of the TensorRT-LLM engine.")
+                help="Configuration of the TensorRT LLM engine.")
 @optgroup.option(
     "--tp_size",
     "-tp",
@@ -333,7 +334,8 @@ def build_command(
               quant_config=quant_config,
               workspace=str(bench_env.workspace),
               load_format=load_format,
-              trust_remote_code=trust_remote_code)
+              trust_remote_code=trust_remote_code,
+              telemetry_config=bench_env.telemetry_config)
     # Save the engine.
     llm.save(engine_dir)
     llm.shutdown()

@@ -23,6 +23,10 @@ set(CMAKE_CUDA_ARCHITECTURES 89-real 90a-real)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_XQA_TESTS "Build XQA tests" OFF)
+set(PAGED_KV_CACHE_LAYOUT
+    "0"
+    CACHE STRING "Paged KV cache format (0 for XQA Original, 1 for VLLM)")
+add_definitions(-DPAGED_KV_CACHE_LAYOUT=${PAGED_KV_CACHE_LAYOUT})
 
 # todo: remove include_directories link_directories and link libs like
 # CUDA::cuda_driver CUDA::cudart CUDA::nvrtc
@@ -37,7 +41,7 @@ set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -march=haswell -Wfatal-errors -Wreturn-type -Wall -Wextra -Wno-unknown-pragmas"
 )
 set(CMAKE_CUDA_FLAGS
-    "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler --expt-relaxed-constexpr -t 0 -res-usage"
+    "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler --expt-relaxed-constexpr -t 0 -res-usage -DPAGED_KV_CACHE_LAYOUT=${PAGED_KV_CACHE_LAYOUT}"
 )
 set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills"
 )# -Werror -v
@@ -89,10 +93,6 @@ if(BUILD_XQA_TESTS)
   if(NOT GTest_FOUND)
     message(STATUS "System GTest not found, fetching from repository")
     include(FetchContent)
-    FetchContent_Declare(
-      googletest
-      GIT_REPOSITORY https://github.com/google/googletest.git
-      GIT_TAG v1.15.2)
     FetchContent_MakeAvailable(googletest)
     include(GoogleTest)
   endif()
@@ -102,10 +102,6 @@ if(BUILD_XQA_TESTS)
   if(NOT Eigen3_FOUND)
     message(STATUS "System Eigen not found, fetching from repository")
     include(FetchContent)
-    FetchContent_Declare(
-      eigen
-      GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-      GIT_TAG 3.4.0)
     FetchContent_MakeAvailable(eigen)
   endif()
 

@@ -18,9 +18,6 @@
 #include "logitsThread.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/batch_manager/peftCacheManager.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
-#include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
@@ -38,10 +35,8 @@ enum class FastLogitsMpiId : uint64_t
 };
 
 void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadShouldExit,
-    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> const& seqSlotManager,
-    SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& kvCacheManager,
-    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& crossKvCacheManager,
-    std::shared_ptr<BasePeftCacheManager> const& peftCacheManager)
+    RequestVector* draftRequestsWaitingToSendLogits, RequestVector* draftRequestsDoneSendingLogits,
+    std::mutex* draftRequestsMtx)
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_CUDA_CHECK(cudaSetDevice(device));
@@ -100,7 +95,11 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
             return nullptr;
         };
 
-        std::shared_ptr<LlmRequest> draftRequest = findDraftRequest();
+        std::shared_ptr<LlmRequest> draftRequest;
+        {
+            std::lock_guard<std::mutex> lk(*draftRequestsMtx);
+            draftRequest = findDraftRequest();
+        }
         TLLM_CHECK(draftRequest != nullptr);
 
         auto draftLogits = runtime::ITensor::slice(draftRequest->getGenerationLogitsHost(), {0, 0});
@@ -115,14 +114,17 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
         worldComm.send(draftLogits->data(), draftLogits->getSizeInBytes(), mpi::MpiType::kUINT8, source_rank,
             mpi::MpiTag::kSpecDecLogitsData);
 
-        terminateRequest(
-            *seqSlotManager, *draftRequest, maxInputLen, kvCacheManager, crossKvCacheManager, peftCacheManager);
+        // Defer termination to the main thread to avoid racing on mSequences.
+        {
+            std::lock_guard<std::mutex> lk(*draftRequestsMtx);
+            draftRequestsDoneSendingLogits->push_back(draftRequest);
+        }
     }
 #endif // ENABLE_MULTI_DEVICE
 }
 
-std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
-    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::ModelConfig const& modelConfig)
+void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
+    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype)
 {
 #if ENABLE_MULTI_DEVICE
     auto const& worldComm = tensorrt_llm::mpi::MpiComm::world();
@@ -151,10 +153,7 @@ std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
     int64_t dims[2];
     MPICHECK(MPI_Mrecv(&dims, count, MPI_INT64_T, &msg, &status));
 
-    auto const logitsDtype = modelConfig.getLogitsDtype();
-
-    auto tensor = tensorrt_llm::runtime::BufferManager::pinnedPool(
-        runtime::ITensor::makeShape({dims[0], dims[1]}), logitsDtype);
+    draftLogitsHost->reshape(runtime::ITensor::makeShape({dims[0], dims[1]}));
 
     worldComm.mprobe(fastLogitsInfo.draftParticipantId, mpi::MpiTag::kSpecDecLogitsData, &msg, &status);
 
@@ -163,11 +162,7 @@ std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
     uint64_t const expectedSize = static_cast<uint64_t>(dims[0]) * dims[1] * tc::getDTypeSize(logitsDtype);
     TLLM_CHECK((uint64_t) count == expectedSize);
 
-    MPICHECK(MPI_Mrecv(tensor->data(), count, MPI_UINT8_T, &msg, &status));
-
-    return tensor;
-#else
-    return std::nullopt;
+    MPICHECK(MPI_Mrecv(draftLogitsHost->data(), count, MPI_UINT8_T, &msg, &status));
 #endif // ENABLE_MULTI_DEVICE
 }
 

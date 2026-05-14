@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -14,10 +15,16 @@ from ..scheduling_params import SchedulingParams
 from .postproc_worker import PostprocParams
 
 __all__ = [
+    "DEFAULT_REQUEST_PRIORITY",
     "LoRARequest",
     "PromptAdapterRequest",
     "GenerationRequest",
+    "TruncateKVCacheRequest",
+    "CancellingRequest",
 ]
+
+# Mirrors C++ executor.h Request::kDefaultPriority
+DEFAULT_REQUEST_PRIORITY: float = 0.5
 
 
 @dataclass(slots=True)
@@ -94,9 +101,13 @@ class GenerationRequest:
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        cache_salt_id: Optional[int] = None,
+        arrival_time: Optional[float] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -121,12 +132,26 @@ class GenerationRequest:
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
+        self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
+        self.cache_salt_id = cache_salt_id
+        self.arrival_time = arrival_time
+        if not (0.0 <= priority <= 1.0):
+            raise ValueError(
+                f"priority must be a float in [0.0, 1.0], got {priority}")
+        self.priority = priority
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"
         self.id = id
         return self
+
+
+class TruncateKVCacheRequest:
+
+    def __init__(self, messages_to_retain: List[int], messages: List[int]):
+        self.messages_to_retain = messages_to_retain
+        self.messages = messages
 
 
 class CancellingRequest:

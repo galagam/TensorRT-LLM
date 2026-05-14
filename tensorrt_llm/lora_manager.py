@@ -1,11 +1,12 @@
 import io
+import itertools
 import json
 import logging
 import re
 import tarfile
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -16,8 +17,13 @@ import yaml
 
 from tensorrt_llm.bindings import internal as tb_internal
 
-from ._utils import DictConversion, pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
+from ._utils import pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
 from .layers.linear import ColumnLinear
+from .lora_helper import (
+    LoraConfig,
+    get_default_trtllm_modules_to_hf_modules,
+    get_missing_qkv_modules_from_lora_modules,
+)
 from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
 
@@ -148,9 +154,28 @@ def iterate_hf_lora(
             hf_module = m.group(3) + "." + module_name
         if hf_module not in hf_modules:
             hf_module = module_name
-            assert hf_module in hf_modules, (
-                f"hf_module {hf_module} is not in supported list {hf_modules}"
-            )
+
+            # If module_name contains dots (e.g., "shared_expert.down_proj"),
+            # extract just the final component (e.g., "down_proj").
+            # Skip this fallback for shared_expert modules to avoid
+            # silently mapping them to the wrong mlp_* module type.
+            if hf_module not in hf_modules and "." in hf_module:
+                if not hf_module.startswith(("shared_expert.", "shared_experts.")):
+                    final_component = hf_module.split(".")[-1]
+                    if final_component in hf_modules:
+                        hf_module = final_component
+
+            if hf_module not in hf_modules:
+                # Skip modules not in the supported mapping (only log once per module type)
+                if hf_module not in getattr(iterate_hf_lora, "_warned_modules", set()):
+                    logger.warning(
+                        f"Skipping unsupported LoRA module '{hf_module}'. "
+                        f"LoRA weights for this module will be ignored."
+                    )
+                    if not hasattr(iterate_hf_lora, "_warned_modules"):
+                        iterate_hf_lora._warned_modules = set()
+                    iterate_hf_lora._warned_modules.add(hf_module)
+                continue  # Skip this module
 
         is_lora_a_or_b = m.group(8) is not None
         if is_lora_a_or_b:
@@ -205,14 +230,14 @@ def get_hf_target_modules(lora_weights, hf_modules):
 def invert_module_mapping(
     trtllm_modules_to_hf_modules: Dict[str, Union[str, List[str]]],
 ) -> Dict[str, str]:
-    """Invert module mapping from TensorRT-LLM -> HF to HF -> TensorRT-LLM.
+    """Invert module mapping from TensorRT LLM -> HF to HF -> TensorRT-LLM.
 
     Args:
-        trtllm_modules_to_hf_modules: Mapping from TensorRT-LLM module names to HF module names
+        trtllm_modules_to_hf_modules: Mapping from TensorRT LLM module names to HF module names
                                      (values can be strings or lists of strings)
 
     Returns:
-        Dictionary mapping HF module names to TensorRT-LLM module names
+        Dictionary mapping HF module names to TensorRT LLM module names
     """
     hf_modules_to_trtllm_modules: Dict[str, str] = {}
     for k, hf_modules in trtllm_modules_to_hf_modules.items():
@@ -233,31 +258,12 @@ def norm_dora_magnitude(
 
 
 @dataclass
-class LoraConfig(DictConversion):
-    lora_dir: List[str] = field(default_factory=list)
-    lora_ckpt_source: str = "hf"
-    max_lora_rank: int = 64
-    lora_target_modules: List[str] = field(default_factory=list)
-    trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
-    max_loras: int | None = None
-    max_cpu_loras: int | None = None
-
-    def __post_init__(self):
-        assert self.lora_ckpt_source in ["hf", "nemo"], (
-            f"lora_ckpt_source must be one of 'hf' or 'nemo', got {self.lora_ckpt_source}"
-        )
-
-    @property
-    def missing_qkv_modules(self) -> List[str]:
-        return LoraManager.get_missing_qkv_modules(self.lora_target_modules)
-
-
-@dataclass
 class LoraModelConfig:
     lora_target_modules: list[str]
     trtllm_modules_to_hf_modules: dict[str, str]
     hidden_size: int
     dtype: str
+    swap_gate_up_proj_lora_b_weight: bool = True
 
 
 class HfLoraLoader:
@@ -430,23 +436,6 @@ def load_nemo_lora(model, lora_config: LoraConfig):
         lora_config.lora_target_modules = lora_loader.lora_target_modules
 
 
-def get_default_trtllm_modules_to_hf_modules():
-    return {
-        "attn_q": "q_proj",
-        "attn_k": "k_proj",
-        "attn_v": "v_proj",
-        "attn_dense": "o_proj",
-        "mlp_h_to_4h": "gate_proj",
-        "mlp_4h_to_h": "down_proj",
-        "mlp_gate": "up_proj",
-        "mlp_gate_up": "gate_up_proj",
-        "moe_h_to_4h": "w1",
-        "moe_4h_to_h": "w2",
-        "moe_gate": "w3",
-        "moe_router": "gate",
-    }
-
-
 def load_torch_hf_lora(lora_config: LoraConfig):
     """This is a shortned version of load_hf_lora that is used for torch models.
 
@@ -454,7 +443,8 @@ def load_torch_hf_lora(lora_config: LoraConfig):
     pivot model config is the transformer's one.
     """
     # TODO smor- need to comibe with load_hf_lora
-    lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
+    if not lora_config.trtllm_modules_to_hf_modules:
+        lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
     lora_loader = HfLoraLoader(lora_config.lora_dir)
@@ -628,19 +618,6 @@ def load_hf_lora(
             ).to(torch_dtype)
 
 
-def use_lora(
-    model,
-    lora_config: LoraConfig,
-    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
-):
-    if lora_config.lora_ckpt_source == "nemo":
-        load_nemo_lora(model, lora_config)
-    elif lora_config.lora_ckpt_source == "hf":
-        load_hf_lora(model, lora_config, trtllm_modules_to_hf_modules)
-    else:
-        raise ValueError(f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
-
-
 def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:
     """Unpack model config and weights from a NeMo .nemo archive file.
 
@@ -673,7 +650,9 @@ def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.T
 
         model_weights_bytes = model_weights_file.read()
         model_weights_dict = torch.load(
-            io.BytesIO(model_weights_bytes), map_location=torch.device("cpu")
+            io.BytesIO(model_weights_bytes),
+            map_location=torch.device("cpu"),
+            weights_only=True,
         )
 
         return model_config_dict, model_weights_dict
@@ -700,14 +679,27 @@ class LoraManager(object):
         "moe_router": 16,
         "mlp_router": 17,
         "mlp_gate_up": 18,
+        "shared_expert_h_to_4h": 19,
+        "shared_expert_4h_to_h": 20,
+        "shared_expert_gate": 21,
+        "mamba_in_proj": 22,
+        "mamba_out_proj": 23,
+        "moe_latent_fc1": 24,
+        "moe_latent_fc2": 25,
     }
 
     def __init__(
-        self, cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None = None
+        self,
+        *,
+        mapping: Mapping,
+        model_config: "ModelConfig",
+        cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None = None,
     ):
         """Constructor.
 
         Args:
+            mapping (Mapping): Parallelism related information.
+            model_config (ModelConfig): model configuration python class instance.
             cpp_peft_cache_manager (PeftCacheManager, optional): used by is_adapter_in_cpu_cache method, that's used for
                 a performance optimization with LoRA of not sending the LoRA adapter weights with every LLM request when
                 the adapter is already loaded in the LoRA CPU cache.
@@ -740,13 +732,18 @@ class LoraManager(object):
 
         self._lora_uid_counter = 0
         self._lora_uid_to_low_ranks: Dict[str, Dict[int, Dict[str, int]]] = {}
-        # hold the torch tensors and prevent them from being freed
-        # TODO(enweiz): free device tensors if it's used for c++ runtime only
+        # When cpp_peft_cache_manager is provided (PyTorch backend), the C++
+        # PeftCacheManager manages its own GPU cache with proper eviction.
+        # The Python-side GPU tensors are only needed by the legacy TRT backend
+        # which reads raw data_ptr() values via input_buffers().
+        self._retain_device_tensors = cpp_peft_cache_manager is None
         self._lora_weights: List[torch.Tensor] = []
         self._lora_weights_pointers_list: Dict[str, Dict[int, Dict[str, List[int]]]] = {}
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
         self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
         self.lora_target_modules: List[str] = []
+        self._mapping = mapping
+        self._model_config = model_config
         self._cpp_peft_cache_manager = cpp_peft_cache_manager
 
     def is_adapter_in_cpu_cache(self, adapter_uid: int) -> bool:
@@ -762,21 +759,8 @@ class LoraManager(object):
         )
 
     @staticmethod
-    def get_missing_qkv_modules(lora_target_modules):
-        # In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or
-        # all disabled at the same time.
-        # However, some lora checkpoint (e.g. BART) only contain two of them, so we use zero tensor
-        # to fill the missing ones.
-        missing_qkv_modules = []
-        if any(x in lora_target_modules for x in ["attn_q", "attn_k", "attn_v"]):
-            for lora_module in ["attn_q", "attn_k", "attn_v"]:
-                if lora_module not in lora_target_modules:
-                    missing_qkv_modules.append(lora_module)
-        if any(x in lora_target_modules for x in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]):
-            for lora_module in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]:
-                if lora_module not in lora_target_modules:
-                    missing_qkv_modules.append(lora_module)
-        return missing_qkv_modules
+    def get_missing_qkv_modules(lora_target_modules: List[str]) -> List[str]:
+        return get_missing_qkv_modules_from_lora_modules(lora_target_modules)
 
     @property
     def missing_qkv_modules(self) -> List[str]:
@@ -786,7 +770,6 @@ class LoraManager(object):
         self,
         model_dirs_or_files: List[str],
         model_config: Union["ModelConfig", LoraModelConfig],
-        runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         ckpt_source: str = "hf",
     ) -> List[str]:
@@ -799,7 +782,6 @@ class LoraManager(object):
             return self.load_from_hf(
                 model_dirs=model_dirs_or_files,
                 model_config=model_config,
-                runtime_mapping=runtime_mapping,
                 uids=uids,
             )
         elif ckpt_source == "nemo":
@@ -810,7 +792,6 @@ class LoraManager(object):
             return self.load_from_nemo(
                 model_files=nemo_files,
                 model_config=model_config,
-                runtime_mapping=runtime_mapping,
                 uids=uids,
             )
         else:
@@ -820,7 +801,6 @@ class LoraManager(object):
         self,
         model_files: List[str],
         model_config: Union["ModelConfig", LoraModelConfig],
-        runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
     ) -> List[str]:
         """Returns the adapter UIDs that were loaded by this call.
@@ -828,11 +808,6 @@ class LoraManager(object):
         Note that when an adapter was already loaded before this call, it would not be
         included in the returned list of UIDs.
         """
-        if runtime_mapping is None:
-            runtime_mapping = Mapping()
-        tp_size = runtime_mapping.tp_size
-        tp_rank = runtime_mapping.tp_rank
-
         if uids is None:
             uids = [self._generate_uid() for _ in range(len(model_files))]
         assert len(uids) == len(model_files)
@@ -885,10 +860,6 @@ class LoraManager(object):
 
                         t_in = all_lora_weights[layer_idx]["in"]
                         t_out = all_lora_weights[layer_idx]["out"]
-                        assert t_out.shape[0] % tp_size == 0
-                        t_out = torch.split(t_out, t_out.shape[0] // tp_size, dim=0)[
-                            tp_rank
-                        ].contiguous()
                     else:
                         t_in = None
                         t_out = None
@@ -898,15 +869,14 @@ class LoraManager(object):
                         t_out = t_out.cuda().to(str_dtype_to_torch(model_config.dtype)).contiguous()
                         rank = t_in.shape[0]
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = int(rank)
-                        self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
-                            t_in.data_ptr(),
-                            t_out.data_ptr(),
-                            0,
-                        ]
-
-                        # prevent torch free this buffer
-                        self._lora_weights.append(t_in)
-                        self._lora_weights.append(t_out)
+                        if self._retain_device_tensors:
+                            self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
+                                t_in.data_ptr(),
+                                t_out.data_ptr(),
+                                0,
+                            ]
+                            self._lora_weights.append(t_in)
+                            self._lora_weights.append(t_out)
                         self._cpp_lora_weights[uid].append(
                             torch.concatenate([t_in.flatten().cpu(), t_out.flatten().cpu()])
                         )
@@ -938,7 +908,6 @@ class LoraManager(object):
         self,
         model_dirs: List[str],
         model_config: Union["ModelConfig", LoraModelConfig],
-        runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         component: Optional[str] = None,
     ) -> List[str]:
@@ -995,11 +964,6 @@ class LoraManager(object):
             ...
 
         """
-        if runtime_mapping is None:
-            runtime_mapping = Mapping()
-        tp_size = runtime_mapping.tp_size
-        tp_rank = runtime_mapping.tp_rank
-
         if uids is None:
             uids = [self._generate_uid() for _ in range(len(model_dirs))]
         assert len(uids) == len(model_dirs)
@@ -1026,17 +990,82 @@ class LoraManager(object):
         )
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
 
-        def preprocess_lora_weights(lora_model):
+        def preprocess_lora_weights(lora_model, model_config):
             # Swap weights of gate_up_proj
-            for key, value in lora_model.items():
-                if "gate_up_proj.lora_B.weight" in key:
-                    original_weights = value.contiguous().clone()
-                    half_split = original_weights.shape[0] // 2
-                    first_half = original_weights[:half_split, :]
-                    second_half = original_weights[half_split:, :]
-                    value = torch.cat((second_half, first_half), dim=0)
-                    lora_model[key] = value
+            if getattr(model_config, "swap_gate_up_proj_lora_b_weight", True):
+                for key, value in lora_model.items():
+                    if "gate_up_proj.lora_B.weight" in key:
+                        original_weights = value.contiguous().clone()
+                        half_split = original_weights.shape[0] // 2
+                        first_half = original_weights[:half_split, :]
+                        second_half = original_weights[half_split:, :]
+                        value = torch.cat((second_half, first_half), dim=0)
+                        lora_model[key] = value
             return lora_model
+
+        def interleave_fused_lora_weights_for_tp(
+            weight: torch.Tensor, rank_dim: int, tp_size: int, part_sizes: List[int]
+        ) -> List[torch.Tensor]:
+            """Interleaves fused LoRA modules weights for TP.
+            e.g.  In case of attn_qkv: Convert t_out=torch.cat([Wq, Wk, Wv]) to
+                  torch.cat([Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN])
+                  where N=TP size.
+            """  # noqa: D205
+            assert weight.shape[rank_dim] == sum(part_sizes)
+
+            # Split the weights into their respective parts. e.g. weight -> [Wq, Wk, Wv] for attn_qkv.
+            weight_parts = [
+                weight.narrow(rank_dim, sum(part_sizes[:i]), part_sizes[i])
+                for i in range(len(part_sizes))
+            ]
+            for i in range(len(part_sizes)):
+                assert weight_parts[i].shape[rank_dim] % tp_size == 0
+
+            # Split each part into tp_size chunks.
+            # e.g. [Wq, Wk, Wv] -> [[Wq_rank0, ..., Wq_rankN], [Wk_rank0, ..., Wk_rankN], [Wv_rank0, ..., Wv_rankN]]
+            # where N is TP size, for attn_qkv.
+            weight_parts_tp_weights = [
+                torch.split(
+                    weight_parts[i], weight_parts[i].shape[rank_dim] // tp_size, dim=rank_dim
+                )
+                for i in range(len(part_sizes))
+            ]
+
+            # Interleave the parts across TP ranks and flatten the list of lists into a single list.
+            # e.g. [[Wq_rank0, ..., Wq_rankN], [Wk_rank0, ..., Wk_rankN], [Wv_rank0, ..., Wv_rankN]]
+            # -> [Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN] where N is TP size, for attn_qkv.
+            return list(itertools.chain.from_iterable(zip(*weight_parts_tp_weights)))
+
+        def prepare_fused_lora_modules_for_tp(
+            lora_module: str, t_out: torch.Tensor, rank_dim: int
+        ) -> torch.Tensor:
+            """Reorders fused LoRA modules weights for TP. This is required since HF stores the parts weights
+            sequentially, whereas with TP>1 we need them to be interleaved so they would be sharded correctly.
+
+            See interleave_fused_lora_weights_for_tp for more details.
+            """  # noqa: D205
+            tp_size = self._mapping.tp_size
+            if tp_size == 1:
+                return t_out
+            part_sizes = []
+            if lora_module == "mlp_gate_up":
+                assert t_out.shape[rank_dim] % 2 == 0
+                half_size = t_out.shape[rank_dim] // 2
+                part_sizes = [half_size, half_size]
+            elif lora_module == "attn_qkv":
+                # The sizes are multiplied by tp_size because num_heads and num_kv_heads here were already
+                # divided by tp_size in tensorrt_llm/_torch/model_config.py::ModelConfig.get_bindings_model_config
+                q_size = self._model_config.head_size * self._model_config.num_heads * tp_size
+                kv_size = self._model_config.head_size * self._model_config.num_kv_heads * tp_size
+                part_sizes = [q_size, kv_size, kv_size]
+
+            if part_sizes:
+                interleaved_parts = interleave_fused_lora_weights_for_tp(
+                    t_out, rank_dim, tp_size, part_sizes
+                )
+                # Concatenate them all after interleaving, as the CPP implementation expects the full non-split weights.
+                t_out = torch.cat(interleaved_parts, dim=rank_dim)
+            return t_out
 
         def load_from_model_dir(uid, model_dir, hf_config):
             if uid not in self._cpp_lora_weights:
@@ -1047,7 +1076,7 @@ class LoraManager(object):
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
-            lora_model = preprocess_lora_weights(lora_model)
+            lora_model = preprocess_lora_weights(lora_model, model_config)
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
@@ -1115,36 +1144,9 @@ class LoraManager(object):
                         t_mag = module_weights.get("magnitude", None)
 
                     is_dora = t_mag is not None
-
-                    if lora_module in ["moe_router", "mlp_router"]:
-                        pass
-                    elif "moe" in lora_module and runtime_mapping.has_moe_ep():
-                        pass
-                    elif lora_module in [
-                        "attn_dense",
-                        "cross_attn_dense",
-                        "mlp_4h_to_h",
-                        "moe_4h_to_h",
-                    ]:
-                        # split by row
-                        dim = 2 if has_expert_indices else 1
-                        assert t_in.shape[dim] % tp_size == 0
-                        t_in = torch.split(t_in, t_in.shape[dim] // tp_size, dim=dim)[
-                            tp_rank
-                        ].contiguous()
-                    else:
-                        # split by column
-                        dim = 1 if has_expert_indices else 0
-                        assert t_out.shape[dim] % tp_size == 0
-                        t_out = torch.split(t_out, t_out.shape[dim] // tp_size, dim=dim)[
-                            tp_rank
-                        ].contiguous()
-                        if dim == 0 and is_dora and t_mag is not None:
-                            t_mag = torch.split(t_mag, t_mag.shape[0] // tp_size, dim=0)[
-                                tp_rank
-                            ].contiguous()
-
                     rank_dim = 1 if has_expert_indices else 0
+                    t_out = prepare_fused_lora_modules_for_tp(lora_module, t_out, rank_dim)
+
                     effective_rank = t_in.shape[rank_dim]
 
                     t_in = t_in.cuda().contiguous()
@@ -1156,24 +1158,27 @@ class LoraManager(object):
                         scale = float(hf_config["lora_alpha"]) / np.sqrt(effective_rank)
                     else:
                         scale = float(hf_config["lora_alpha"]) / effective_rank
+
+                    # Cast to model dtype before scaling
+                    # fp8 tensors don't support scalar multiply in PyTorch
+                    model_dtype = str_dtype_to_torch(model_config.dtype)
+                    t_in = t_in.to(model_dtype)
+                    t_out = t_out.to(model_dtype)
                     t_out = t_out * scale
-                    t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
-                    t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
                     if is_dora and t_mag is not None:
-                        t_mag = t_mag.to(str_dtype_to_torch(model_config.dtype))
+                        t_mag = t_mag.to(model_dtype)
 
                     self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = effective_rank
-                    self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
-                        t_in.data_ptr(),
-                        t_out.data_ptr(),
-                        t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
-                    ]
-
-                    # prevent torch free this buffer
-                    self._lora_weights.append(t_in)
-                    self._lora_weights.append(t_out)
-                    if is_dora and t_mag is not None:
-                        self._lora_weights.append(t_mag)
+                    if self._retain_device_tensors:
+                        self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
+                            t_in.data_ptr(),
+                            t_out.data_ptr(),
+                            t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
+                        ]
+                        self._lora_weights.append(t_in)
+                        self._lora_weights.append(t_out)
+                        if is_dora and t_mag is not None:
+                            self._lora_weights.append(t_mag)
 
                     t_in_cpu = t_in.flatten().cpu()
                     t_out_cpu = t_out.flatten().cpu()

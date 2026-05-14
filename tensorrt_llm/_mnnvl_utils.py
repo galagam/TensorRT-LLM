@@ -12,14 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ctypes
+import os
 import platform
 import sys
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Union
 
 import pynvml
 import torch
-from cuda import cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
 
 from ._dlpack_utils import pack_strided_memory
 from ._utils import mpi_comm
@@ -45,38 +51,54 @@ def _check_cu_result(cu_func_ret):
 
 
 class MnnvlMemory:
+    """MNNVL memory management for tensor parallel (TP) operations."""
+
+    # Shared across all subclasses (global/device state).
     initialized: bool = False
-
-    current_mem_offset: int = 0
-    current_rank_stride: int = 0  # stride for ranks and also address space size.
-    current_start_address: int = 0
-
-    # allocation granularity
     allocation_granularity: int = 0
-
-    # fabric address page size (512 MB)
-    fabric_page_size: int = 1 << 29
-
-    # MPI communicator
-    comm = None
-
+    fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
 
+    # Per-class state attributes. These will be auto-initialized for each subclass
+    # to avoid polluting the parent class's state. Use callable (e.g., dict) for mutable defaults.
+    _per_class_attrs = {
+        "current_mem_offset": 0,
+        "current_rank_stride": 0,  # stride for ranks and also address space size.
+        "current_start_address": 0,
+        "comm": None,  # MPI communicator.
+        "allocated_map": dict,  # callable for fresh dict.
+        "address_refcnt": dict,  # callable for fresh dict.
+    }
+
+    # Initialize per-class state for the base class.
+    current_mem_offset: int = 0
+    current_rank_stride: int = 0
+    current_start_address: int = 0
+    comm = None
     allocated_map = {}
     address_refcnt = {}
+
+    def __init_subclass__(cls, **kwargs):
+        """Auto-initialize per-class attributes for each subclass to avoid sharing state with parent."""
+        super().__init_subclass__(**kwargs)
+        for attr, default in cls._per_class_attrs.items():
+            if callable(default):
+                setattr(cls, attr, default())  # e.g., dict() creates a fresh dict.
+            else:
+                setattr(cls, attr, default)
 
     def __init__(self, mapping: Mapping, size: int):
         self.mapping = mapping
         self.segment_size = size
-        self.ptr, self.rank_stride = MnnvlMemory.open_mnnvl_memory(self.mapping, size)
+        self.ptr, self.rank_stride = type(self).open_mnnvl_memory(self.mapping, size)
 
     def __del__(self):
         if not sys.is_finalizing():
             if hasattr(self, "ptr"):
-                MnnvlMemory.close_mnnvl_memory(self.ptr)
+                type(self).close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
-        num_segments = MnnvlMemory.comm.Get_size()
+        num_segments = type(self).comm.Get_size()
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
@@ -93,14 +115,17 @@ class MnnvlMemory:
                 pynvml.nvmlInit()
             MnnvlMemory.initialized = True
 
-    @staticmethod
-    def get_comm(mapping: Mapping):
-        if MnnvlMemory.comm is not None:
-            return MnnvlMemory.comm
+    @classmethod
+    def get_comm(cls, mapping: Mapping):
+        """Get TP-based communicator (ranks grouped by PP+CP+MOE_TP, ordered by TP rank)."""
+        if cls.comm is not None:
+            return cls.comm
         comm = mpi_comm().Split(
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+            (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
+            + mapping.moe_tp_rank,
+            mapping.tp_rank,
         )
-        MnnvlMemory.comm = comm
+        cls.comm = comm
         return comm
 
     @staticmethod
@@ -110,9 +135,19 @@ class MnnvlMemory:
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        allocation_prop.requestedHandleTypes = (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        )
+
+        # TODO: We differentiate FABRIC for GB200 (aarch64) and POSIX_FILE_DESCRIPTOR for BB200 (x86_64).
+        # May need to find a better way to handle this.
+        arch = platform.machine().lower()
+        is_on_aarch64 = "aarch64" in arch
+        if is_on_aarch64:
+            allocation_prop.requestedHandleTypes = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            )
+        else:
+            allocation_prop.requestedHandleTypes = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
         allocation_prop.location = location
         return allocation_prop
 
@@ -130,23 +165,26 @@ class MnnvlMemory:
         MnnvlMemory.allocation_granularity = granularity
         return MnnvlMemory.allocation_granularity
 
-    @staticmethod
-    def new_mnnvl_memory_address(mapping: Mapping, size: int):
+    @classmethod
+    def new_mnnvl_memory_address(cls, mapping: Mapping, size: int):
         page_count = (size + MnnvlMemory.fabric_page_size - 1) // MnnvlMemory.fabric_page_size
         current_rank_stride = page_count * MnnvlMemory.fabric_page_size
-        logger.info(f"[MnnvlMemory] creating address with stride={current_rank_stride}")
-        comm = MnnvlMemory.get_comm(mapping)
+        logger.info(f"[{cls.__name__}] creating address with stride={current_rank_stride}")
+        comm = cls.get_comm(mapping)
         comm_size = comm.Get_size()
         address_size = current_rank_stride * comm_size
         ptr = _check_cu_result(
             cuda.cuMemAddressReserve(address_size, MnnvlMemory.fabric_page_size, 0, 0)
         )
-        MnnvlMemory.current_start_address = int(ptr)
-        MnnvlMemory.current_rank_stride = current_rank_stride
-        MnnvlMemory.current_mem_offset = 0
+        cls.current_start_address = int(ptr)
+        cls.current_rank_stride = current_rank_stride
+        cls.current_mem_offset = 0
 
-    @staticmethod
-    def open_mnnvl_memory(mapping: Mapping, size: int):
+    @classmethod
+    def open_mnnvl_memory(cls, mapping: Mapping, size: int):
+        # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
+        MnnvlMemory.initialize()
+
         dev = _check_cu_result(cuda.cuCtxGetDevice())
         dev_id = int(dev)
         if MnnvlMemory.dev_id is None:
@@ -154,7 +192,7 @@ class MnnvlMemory:
         assert dev_id == MnnvlMemory.dev_id, (
             f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
-        comm = MnnvlMemory.get_comm(mapping)
+        comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
         all_rank_allocate_sizes = comm.allgather(size)
@@ -163,10 +201,10 @@ class MnnvlMemory:
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
-        if MnnvlMemory.current_mem_offset + aligned_size > MnnvlMemory.current_rank_stride:
-            MnnvlMemory.new_mnnvl_memory_address(mapping, aligned_size)
+        if cls.current_mem_offset + aligned_size > cls.current_rank_stride:
+            cls.new_mnnvl_memory_address(mapping, aligned_size)
 
-        assert MnnvlMemory.current_mem_offset + aligned_size <= MnnvlMemory.current_rank_stride
+        assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
 
         allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
         allocated_mem_handle = _check_cu_result(
@@ -174,10 +212,77 @@ class MnnvlMemory:
         )
         exported_fabric_handle = _check_cu_result(
             cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
+                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        all_handles_data = comm.allgather(exported_fabric_handle.data)
+        pidfds = []
+        remote_fds = []
+        try:
+            if (
+                allocation_prop.requestedHandleTypes
+                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            ):
+                all_handles_data = comm.allgather(exported_fabric_handle.data)
+            else:
+                all_handles_data = comm.allgather(exported_fabric_handle)
+                all_pids = comm.allgather(os.getpid())
+                libc = ctypes.CDLL(None, use_errno=True)
+                syscall = libc.syscall
+                SYS_pidfd_open = 434
+                SYS_pidfd_getfd = 438
+                for i, pid in enumerate(all_pids):
+                    pidfd = syscall(SYS_pidfd_open, pid, 0)
+                    if pidfd < 0:
+                        err = ctypes.get_errno()
+                        raise RuntimeError(
+                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                        )
+                    pidfds.append(pidfd)
+
+                for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
+                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                    if remote_fd < 0:
+                        err = ctypes.get_errno()
+                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
+                        if err == 1:  # EPERM
+                            error_msg += (
+                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
+                                "to your docker run command."
+                            )
+                        else:
+                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                        raise RuntimeError(error_msg)
+                    remote_fds.append(remote_fd)
+
+                all_handles_data = remote_fds
+        except Exception:
+            # Release resources on failure path to avoid leaks; then re-raise.
+            if isinstance(exported_fabric_handle, int):
+                try:
+                    os.close(exported_fabric_handle)
+                except OSError as e:
+                    logger.warning(
+                        "Failed to close exported shareable handle on error: %s",
+                        e,
+                    )
+            try:
+                _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
+            except RuntimeError as e:
+                logger.warning(
+                    "cuMemRelease failed during error cleanup (original error will be raised): %s",
+                    e,
+                )
+            for _pidfd in pidfds:
+                try:
+                    os.close(_pidfd)
+                except OSError:
+                    pass
+            for _rfd in remote_fds:
+                try:
+                    os.close(_rfd)
+                except OSError:
+                    pass
+            raise
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -189,9 +294,7 @@ class MnnvlMemory:
 
         for i, remote_handle_data in enumerate(all_handles_data):
             rank_ptr = (
-                MnnvlMemory.current_start_address
-                + MnnvlMemory.current_rank_stride * i
-                + MnnvlMemory.current_mem_offset
+                cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
             )
             if i == comm_rank:
                 # Local memory mapping
@@ -201,7 +304,7 @@ class MnnvlMemory:
                 # Fabric memory mapping
                 imported_mem_handle = _check_cu_result(
                     cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                        remote_handle_data, allocation_prop.requestedHandleTypes
                     )
                 )
                 mem_handles[i] = imported_mem_handle
@@ -209,44 +312,44 @@ class MnnvlMemory:
 
             _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
 
-        ptr = MnnvlMemory.current_start_address + MnnvlMemory.current_mem_offset
-        stride = MnnvlMemory.current_rank_stride
-        MnnvlMemory.allocated_map[ptr] = (
+        ptr = cls.current_start_address + cls.current_mem_offset
+        stride = cls.current_rank_stride
+        cls.allocated_map[ptr] = (
             mapping,
             aligned_size,
             mem_handles,
-            MnnvlMemory.current_start_address,
-            MnnvlMemory.current_rank_stride,
-            MnnvlMemory.current_mem_offset,
+            cls.current_start_address,
+            cls.current_rank_stride,
+            cls.current_mem_offset,
         )
-        MnnvlMemory.address_refcnt[MnnvlMemory.current_start_address] = (
-            MnnvlMemory.address_refcnt.get(MnnvlMemory.current_start_address, 0) + 1
+        cls.address_refcnt[cls.current_start_address] = (
+            cls.address_refcnt.get(cls.current_start_address, 0) + 1
         )
 
-        MnnvlMemory.current_mem_offset += aligned_size
+        cls.current_mem_offset += aligned_size
         return ptr, stride
 
-    @staticmethod
-    def close_mnnvl_memory(ptr: int):
+    @classmethod
+    def close_mnnvl_memory(cls, ptr: int):
         mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
-            MnnvlMemory.allocated_map.pop(ptr)
+            cls.allocated_map.pop(ptr)
         )
-        comm = MnnvlMemory.get_comm(mapping)
+        comm = cls.get_comm(mapping)
         comm_size = comm.Get_size()
         for i in range(comm_size):
             rank_ptr = start_address + i * rank_stride + address_offset
             _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
             _check_cu_result(cuda.cuMemRelease(mem_handles[i]))
-        MnnvlMemory.address_refcnt[start_address] -= 1
+        cls.address_refcnt[start_address] -= 1
 
-        if MnnvlMemory.address_refcnt[start_address] == 0:
-            MnnvlMemory.address_refcnt.pop(start_address)
+        if cls.address_refcnt[start_address] == 0:
+            cls.address_refcnt.pop(start_address)
             device_ptr = cuda.CUdeviceptr(start_address)
             _check_cu_result(cuda.cuMemAddressFree(device_ptr, comm_size * rank_stride))
-            if start_address == MnnvlMemory.current_start_address:
-                MnnvlMemory.current_start_address = 0
-                MnnvlMemory.current_rank_stride = 0
-                MnnvlMemory.current_mem_offset = 0
+            if start_address == cls.current_start_address:
+                cls.current_start_address = 0
+                cls.current_rank_stride = 0
+                cls.current_mem_offset = 0
 
     @staticmethod
     def support_nvlink(need_all_up: bool = True):
@@ -275,13 +378,51 @@ class MnnvlMemory:
     @staticmethod
     def supports_mnnvl() -> bool:
         # TODO:
-        # We check if it is an aarch64 platform and has all NVLink up now.
+        # We check if it has all NVLink up now.
         # But it is not equivalent to MNNVL support.
         # May need better support check.
-        arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
-        return is_on_aarch64 and support_nvlink_and_all_up
+        return support_nvlink_and_all_up
+
+
+class HelixCpMnnvlMemory(MnnvlMemory):
+    """MNNVL memory management for Helix context parallel (CP) operations.
+
+    Per-class state (current_mem_offset, comm, allocated_map, etc.) is automatically
+    initialized via __init_subclass__ in the parent class, ensuring this class has
+    its own isolated state separate from MnnvlMemory.
+    """
+
+    @classmethod
+    def get_comm(cls, mapping: Mapping):
+        """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
+        if cls.comm is not None:
+            return cls.comm
+        comm = mpi_comm().Split(
+            mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
+            mapping.cp_rank,
+        )
+        cls.comm = comm
+        return comm
+
+
+def init_helix_cp_comm(mapping: Mapping) -> None:
+    """Pre-initialize the Helix CP communicator.
+
+    This function MUST be called during model initialization when all ranks
+    are synchronized (before any PP pipeline divergence). The MPI Split operation
+    is collective and requires all ranks in the communicator to participate.
+
+    In PP (pipeline parallel) mode, different PP stages execute different parts
+    of the model at different times. If the communicator is initialized lazily
+    during the first forward pass, ranks in different PP stages may not reach
+    the Split operation at the same time, causing a deadlock.
+
+    Args:
+        mapping: The mapping object containing parallelism configuration.
+    """
+    if mapping.has_cp_helix() and not mapping.cp_config.get("use_nccl_for_alltoall", True):
+        HelixCpMnnvlMemory.get_comm(mapping)
 
 
 @dataclass
@@ -310,10 +451,15 @@ class MnnvlMoe:
 
         MnnvlMoe.moe_mapping = mapping
         workspace_size_per_rank = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(
-            mapping.tp_size
+            mapping.moe_ep_size
         )
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(torch.uint64)
+        torch.ops.trtllm.moe_initialize_workspace(
+            MnnvlMoe.moe_workspace_tensor, mapping.moe_ep_rank, mapping.moe_ep_size
+        )
+        torch.cuda.synchronize()
+        MnnvlMoe.moe_workspace.comm.barrier()
         return MnnvlMoe.moe_workspace_tensor
 
     @staticmethod
@@ -322,7 +468,7 @@ class MnnvlMoe:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
             return MnnvlMoe.moe_prepare_workspace_tensor
         workspace_size_per_rank = torch.ops.trtllm.get_moe_prepare_workspace_size_per_rank(
-            mapping.tp_size
+            mapping.moe_ep_size
         )
         MnnvlMoe.moe_prepare_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_prepare_workspace_tensor = (
@@ -342,7 +488,6 @@ class MnnvlMoe:
     @staticmethod
     def mnnvl_moe_alltoallv_prepare_without_allgather(
         expert_ids: torch.Tensor,
-        scales: torch.Tensor,
         expert_statics: Optional[torch.Tensor],
         workspace: torch.Tensor,
         max_token_count_per_rank: int,
@@ -353,8 +498,6 @@ class MnnvlMoe:
         top_k: int,
     ):
         (
-            prepared_local_experts,
-            prepared_local_scales,
             local_send_rank_count_cumsum,
             local_send_rank_indices,
             local_recv_rank_count_cumsum,
@@ -363,7 +506,6 @@ class MnnvlMoe:
             gathered_expert_statics,
         ) = torch.ops.trtllm.mnnvl_moe_alltoallv_prepare_without_allgather(
             expert_ids,
-            scales,
             expert_statics,
             workspace,
             max_token_count_per_rank,
@@ -388,7 +530,7 @@ class MnnvlMoe:
             local_token_allocation_count,
         )
 
-        return alltoall_info, prepared_local_experts, prepared_local_scales, gathered_expert_statics
+        return alltoall_info, gathered_expert_statics
 
     @staticmethod
     def mnnvl_moe_expert_static_allgather(
@@ -474,31 +616,67 @@ class MnnvlMoe:
 
     @staticmethod
     def mnnvl_moe_alltoallv(
-        x: torch.Tensor,
+        x: Union[torch.Tensor, List[Optional[torch.Tensor]]],
         alltoall_info: MoEAlltoallInfo,
         workspace: torch.Tensor,
         ep_rank: int,
         ep_size: int,
-    ):
-        assert x.dim() == 2, "only 2D tensor supported, please reshape."
-        output_tensor = torch.empty(
-            alltoall_info.local_token_allocation_count,
-            x.shape[1],
-            dtype=x.dtype,
-            device=torch.device("cuda"),
-        )
-        torch.ops.trtllm.moe_comm(
-            x,
-            alltoall_info.send_rank_count_cumsum,
-            alltoall_info.send_rank_local_indices,
-            output_tensor,
-            alltoall_info.recv_rank_count_cumsum,
-            alltoall_info.recv_rank_local_indices,
-            workspace,
-            ep_rank,
-            ep_size,
-        )
-        return output_tensor
+    ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
+        # Convert single tensor to list for unified handling
+        is_single_tensor = not isinstance(x, list)
+        if is_single_tensor:
+            assert x.dim() == 2, "only 2D tensor supported, please reshape."
+            x = [x]
+
+        assert len(x) > 0, "Empty tensor list not supported"
+
+        # Filter out None values
+        valid_list = [tensor is not None for tensor in x]
+        valid_tensors = [tensor for tensor in x if tensor is not None]
+
+        if len(valid_tensors) == 0:
+            # All tensors are None, return list of None
+            result = [None] * len(x)
+        else:
+            first_dim = None
+            for tensor in valid_tensors:
+                # Validate dimensions of valid tensors
+                assert tensor.dim() == 2, "only 2D tensor supported, please reshape."
+                if first_dim is None:
+                    first_dim = tensor.shape[0]
+                else:
+                    assert tensor.shape[0] == first_dim, (
+                        f"All tensors must have the same first dimension, got {tensor.shape[0]} vs {first_dim}"
+                    )
+
+            # Process only valid tensors
+            output_tensors = torch.ops.trtllm.moe_comm(
+                valid_tensors,
+                alltoall_info.send_rank_count_cumsum,
+                alltoall_info.send_rank_local_indices,
+                alltoall_info.recv_rank_count_cumsum,
+                alltoall_info.recv_rank_local_indices,
+                workspace,
+                alltoall_info.local_token_allocation_count,
+                ep_rank,
+                ep_size,
+            )
+
+            # Restore None positions in output
+            idx = 0
+            result = []
+            for is_valid in valid_list:
+                if is_valid:
+                    result.append(output_tensors[idx])
+                    idx += 1
+                else:
+                    result.append(None)
+
+        # If input was a single tensor, return a single tensor
+        if is_single_tensor:
+            result = result[0]
+
+        return result
 
     @staticmethod
     def mnnvl_moe_alltoallv_combine(
@@ -509,22 +687,25 @@ class MnnvlMoe:
         ep_size: int,
         top_k: int,
         token_count: int,
+        use_low_precision_combine: bool = False,
+        do_reduce: bool = True,
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
-        output_tensor = torch.zeros(
-            token_count * top_k, x.shape[1], dtype=x.dtype, device=torch.device("cuda")
-        )
-        torch.ops.trtllm.moe_comm(
-            x,
+        output_tensors = torch.ops.trtllm.moe_comm(
+            [x],
             alltoall_info.recv_rank_count_cumsum,
             alltoall_info.recv_rank_local_indices,
-            output_tensor,
             alltoall_info.send_rank_count_cumsum,
             alltoall_info.backward_recv_rank_local_indices,
             workspace,
+            token_count * top_k,
             ep_rank,
             ep_size,
+            [True],
+            use_low_precision_combine,
         )
-        return torch.sum(
-            output_tensor.reshape(token_count, top_k, x.shape[1]), dim=1, keepdim=False
-        )
+        output_tensor = output_tensors[0].reshape(token_count, top_k, x.shape[1])
+        if do_reduce:
+            return torch.sum(output_tensor, dim=1, keepdim=False)
+        else:
+            return output_tensor

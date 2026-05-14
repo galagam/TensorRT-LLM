@@ -7,7 +7,11 @@ import time
 import traceback
 
 import tensorrt as trt
-from cuda import cudart
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 import tensorrt_llm
 from tensorrt_llm import (AutoConfig, AutoModelForCausalLM, BuildConfig,
@@ -193,7 +197,7 @@ def build_from_hf(args,
 
     quant_config = None
     if args.quant == 'fp8':
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
 
     phase_and_time = []
     if load_weights:

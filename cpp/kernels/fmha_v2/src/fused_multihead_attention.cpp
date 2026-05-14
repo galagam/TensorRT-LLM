@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include <algorithm>
@@ -29,30 +34,33 @@ using Kv_block_array = fmha::Kv_block_array;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_softmax_fp32(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_q_seqlens_d,
-    int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n, bool has_alibi);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void run_softmax_e4m3(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_q_seqlens_d,
-    int s_inner, int s_outer, int b, int h, float scale_softmax, float softcapping_scale_bmm1, int warps_n,
+void run_softmax_fp32(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_q_seqlens_d, int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n,
     bool has_alibi);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_softmax_fp16(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_q_seqlens_d,
-    int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n, bool has_alibi);
+void run_softmax_e4m3(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_q_seqlens_d, int s_inner, int s_outer, int b, int h, float scale_softmax, float softcapping_scale_bmm1,
+    int warps_n, bool has_alibi);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_softmax_bf16(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_q_seqlens_d,
-    int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n, bool has_alibi);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void run_softmax_int8(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_q_seqlens_d,
-    int s_inner, int s_outer, int b, int h, float scale_i2f, float scale_f2i, float softcapping_scale_bmm1, int warps_n,
+void run_softmax_fp16(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_q_seqlens_d, int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n,
     bool has_alibi);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void run_softmax_bf16(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_q_seqlens_d, int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n,
+    bool has_alibi);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void run_softmax_int8(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_q_seqlens_d, int s_inner, int s_outer, int b, int h, float scale_i2f, float scale_f2i,
+    float softcapping_scale_bmm1, int warps_n, bool has_alibi);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -81,11 +89,11 @@ void run_sage_quant(unsigned int batch_size, unsigned int head_num, unsigned int
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void ground_truth(RefBMM& bmm1, RefBMM& bmm2, Data_type const data_type, Data_type const acc_type,
+void ground_truth(RefBMM& bmm1, RefBMM& bmm2, const Data_type data_type, const Data_type acc_type,
     float const scale_bmm1, float const scale_softmax, float const scale_bmm2, float const softcapping_scale_bmm1,
-    void* qkv_d, void* vt_d, void* mask_d, void* p_d, void* s_d, void* tmp_d, void* o_d, void* softmax_sum_d,
-    void* cu_q_seqlens_d, size_t const b, size_t const s, size_t const h, size_t const d, size_t const dv,
-    int const runs, int const warps_m, int const warps_n, bool const has_alibi)
+    void* qkv_d, void* vt_d, void* mask_d, void* attention_sinks_d, void* p_d, void* s_d, void* tmp_d, void* o_d,
+    void* softmax_sum_d, void* cu_q_seqlens_d, const size_t b, const size_t s, const size_t h, const size_t d,
+    const size_t dv, int const runs, int const warps_m, int const warps_n, bool const has_alibi)
 {
 
     cudaStream_t stream = 0;
@@ -106,28 +114,28 @@ void ground_truth(RefBMM& bmm1, RefBMM& bmm2, Data_type const data_type, Data_ty
         // Softmax.
         if (data_type == DATA_TYPE_FP16 && acc_type == DATA_TYPE_FP16)
         {
-            run_softmax_fp16(s_d, p_d, mask_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h, softcapping_scale_bmm1,
-                warps_n, has_alibi);
+            run_softmax_fp16(s_d, p_d, mask_d, attention_sinks_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h,
+                softcapping_scale_bmm1, warps_n, has_alibi);
         }
         else if (data_type == DATA_TYPE_BF16 && acc_type == DATA_TYPE_FP32)
         {
-            run_softmax_bf16(s_d, p_d, mask_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h, softcapping_scale_bmm1,
-                warps_n, has_alibi);
+            run_softmax_bf16(s_d, p_d, mask_d, attention_sinks_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h,
+                softcapping_scale_bmm1, warps_n, has_alibi);
         }
         else if (data_type == DATA_TYPE_FP16 && acc_type == DATA_TYPE_FP32)
         {
-            run_softmax_fp32(s_d, p_d, mask_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h, softcapping_scale_bmm1,
-                warps_n, has_alibi);
+            run_softmax_fp32(s_d, p_d, mask_d, attention_sinks_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h,
+                softcapping_scale_bmm1, warps_n, has_alibi);
         }
         else if (data_type == DATA_TYPE_E4M3 && acc_type == DATA_TYPE_FP32)
         {
-            run_softmax_e4m3(s_d, p_d, mask_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h, scale_softmax,
-                softcapping_scale_bmm1, warps_n, has_alibi);
+            run_softmax_e4m3(s_d, p_d, mask_d, attention_sinks_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h,
+                scale_softmax, softcapping_scale_bmm1, warps_n, has_alibi);
         }
         else if (data_type == DATA_TYPE_INT8 && acc_type == DATA_TYPE_INT32)
         {
-            run_softmax_int8(s_d, p_d, mask_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h, scale_bmm1, scale_softmax,
-                softcapping_scale_bmm1, warps_n, has_alibi);
+            run_softmax_int8(s_d, p_d, mask_d, attention_sinks_d, softmax_sum_d, cu_q_seqlens_d, s, s, b, h, scale_bmm1,
+                scale_softmax, softcapping_scale_bmm1, warps_n, has_alibi);
         }
         else
         {
@@ -179,7 +187,7 @@ static inline void set_params(bert::Fused_multihead_attention_params_v1& params,
     // types
     Data_type data_type, Data_type acc_type,
     // sizes
-    size_t const b, size_t const s, size_t const h, size_t const d, size_t const packed_mask_stride,
+    const size_t b, const size_t s, const size_t h, const size_t d, const size_t packed_mask_stride,
     // device pointers
     void* qkv_d, void* packed_mask_d, void* o_d, void* p_d, void* s_d,
     // scale factors
@@ -235,17 +243,17 @@ static inline void set_params(bert::Fused_multihead_attention_params_v1& params,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static inline void set_params(bert::Fused_multihead_attention_params_v2& params, Launch_params const launch_params,
+static inline void set_params(bert::Fused_multihead_attention_params_v2& params, const Launch_params launch_params,
     // types
     Data_type data_type, Data_type acc_type, Data_type output_dtype,
     // attention input layout
     Attention_input_layout input_layout,
     // sizes
-    size_t const b, size_t const s_q, size_t const s_kv, size_t const h, size_t const h_kv, size_t const d,
-    size_t const dv, size_t const total, const size_t num_grouped_heads, const size_t sliding_window_size,
+    const size_t b, const size_t s_q, const size_t s_kv, const size_t h, const size_t h_kv, const size_t d,
+    const size_t dv, const size_t total, const size_t num_grouped_heads, const size_t sliding_window_size,
     const size_t chunked_attention_size,
     // paged kv cache block size.
-    size_t const tokens_per_block,
+    const size_t tokens_per_block,
     // device pointers
     void* qkv_packed_d,
     // contiguous q.
@@ -261,12 +269,15 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     // offsets for different blocks in terms of the start address.
     int32_t* paged_block_offsets,
     // mask input.
-    void* packed_mask_d, void* cu_mask_rows_d, void* cu_kv_seqlens_d, void* cu_q_seqlens_d, void* o_packed_d, void* p_d,
-    void* s_d, void* softmax_stats_d, void* scale_bmm2_d,
+    void* packed_mask_d, void* cu_mask_rows_d,
+    // attention sinks.
+    void* attention_sinks_d, void* cu_kv_seqlens_d, void* cu_q_seqlens_d, void* o_packed_d, void* p_d, void* s_d,
+    void* softmax_stats_d, void* scale_bmm2_d,
     // scale factors
     float const scale_bmm1, float const scale_softmax, float const scale_bmm2, float const softcapping_scale_bmm1,
     // flags
-    bool const use_int8_scale_max, bool const interleaved, bool const is_s_padded, bool const has_alibi)
+    bool const use_int8_scale_max, bool const interleaved, bool const is_s_padded, bool const has_alibi,
+    float const skip_softmax_threshold_scale_factor)
 {
 
     memset(&params, 0, sizeof(params));
@@ -329,6 +340,11 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     // The N dimension has to be aligned.
     params.packed_mask_stride_in_bytes = (align_to(int64_t(s_kv), int64_t(fmha::FLASH_ATTEN_MASK_N_ALIGNMENT))) / 8;
 
+    // Attention sinks.
+    params.attention_sinks = reinterpret_cast<float*>(attention_sinks_d);
+    assert((attention_sinks_d == nullptr || launch_params.flash_attention)
+        && "attention sinks are only supported with flash attention");
+
 #if defined(STORE_P)
     params.p_ptr = p_d;
     params.p_stride_in_bytes = get_size_in_bytes(b * h * s_kv, acc_type);
@@ -340,7 +356,7 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
 #endif // defined(STORE_S)
 
     params.softmax_stats_ptr = softmax_stats_d;
-    params.softmax_stats_stride_in_bytes = get_size_in_bytes(h, DATA_TYPE_FP32);
+    params.softmax_stats_stride_in_bytes = get_size_in_bytes(h * 2, DATA_TYPE_FP32);
 
     // Set the dimensions.
     params.b = b;
@@ -408,17 +424,20 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
         params.enable_i2f_trick
             = -double(1 << 22) * double(scale_bmm2) <= -128.f && double(1 << 22) * double(scale_bmm2) >= 127.f;
     }
+
+    // Skip-softmax attention
+    params.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static inline void determine_launch_params(Launch_params& launch_params, Data_type data_type, int sm, size_t const s,
-    size_t const d, Attention_mask_type const attention_mask_type, Attention_input_layout const input_layout,
+static inline void determine_launch_params(Launch_params& launch_params, Data_type data_type, int sm, const size_t s,
+    const size_t d, const Attention_mask_type attention_mask_type, const Attention_input_layout input_layout,
     bool const interleaved, bool const ignore_b1opt, bool const force_unroll, bool const use_tma,
     bool const force_non_flash_attention, bool const force_non_warp_specialization,
-    bool const force_non_granular_tiling, bool const force_fp32_acc,
+    bool const force_non_granular_tiling, bool const force_fp32_acc, float const skip_softmax_threshold_scale_factor,
     // device props
-    cudaDeviceProp const props)
+    const cudaDeviceProp props)
 {
 
     // Set launch params to choose kernels
@@ -457,6 +476,9 @@ static inline void determine_launch_params(Launch_params& launch_params, Data_ty
             "are not supported on Ada currently.\n");
         launch_params.use_granular_tiling = false;
     }
+
+    // Enable skip softmax attention or not.
+    launch_params.enable_skip_softmax = skip_softmax_threshold_scale_factor > 0.f;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -572,6 +594,12 @@ int main(int argc, char** argv)
 
     // SageAttention block sizes
     int sage_block_size_q = 0, sage_block_size_k = 0, sage_block_size_v = 0;
+
+    // Use attention sinks (added to the denominator of softmax)
+    bool use_attention_sinks = false;
+
+    // Skip-softmax attention
+    float skip_softmax_threshold_scale_factor = 0;
 
     // Read the parameters from the command-line.
     for (int ii = 1; ii < argc; ++ii)
@@ -753,6 +781,10 @@ int main(int argc, char** argv)
         {
             attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
         }
+        else if (!strcmp(argv[ii], "-bidirectional-sliding-window-mask"))
+        {
+            attention_mask_type = Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW;
+        }
         else if (!strcmp(argv[ii], "-custom-mask"))
         {
             attention_mask_type = Attention_mask_type::CUSTOM_MASK;
@@ -865,25 +897,30 @@ int main(int argc, char** argv)
         {
             sage_block_size_v = strtol(argv[ii], nullptr, 10);
         }
+        else if (!strcmp(argv[ii], "-use-attention-sinks"))
+        {
+            use_attention_sinks = true;
+        }
+        else if (!strcmp(argv[ii], "-skip-softmax-threshold-scale-factor") && ++ii < argc)
+        {
+            skip_softmax_threshold_scale_factor = strtof(argv[ii], nullptr);
+        }
         else
         {
             fprintf(stderr, "Unrecognized option: %s. Aborting!\n", argv[ii]);
             return -1;
         }
     }
-
     if (save_softmax == true)
     {
-        if (input_layout != Attention_input_layout::CONTIGUOUS_Q_KV)
+        bool is_MLA = (d == 192 && dv == 128);
+        if (((!is_MLA) && input_layout != Attention_input_layout::CONTIGUOUS_Q_KV)
+            || (is_MLA && input_layout != Attention_input_layout::SEPARATE_Q_K_V))
         {
-            input_layout = Attention_input_layout::CONTIGUOUS_Q_KV;
-            printf(
-                "Only '--contiguous-q-kv' layout supports '-save-softmax', switched to "
-                "contiguous-q-kv\n");
-        }
-        if (data_type == DATA_TYPE_E4M3)
-        {
-            fprintf(stderr, "Currently fp8 kernel doesn't support fp8.\n");
+            fprintf(stderr,
+                "For normal attention, Only '--contiguous-q-kv' layout supports "
+                "'-save-softmax'. For MLA only '-separate-q-k-v' layout supports "
+                "'-save-softmax'.\n");
             exit(1);
         }
     }
@@ -910,13 +947,20 @@ int main(int argc, char** argv)
     {
         assert(
             chunked_attention_size == 0 && "chunked_attention_size should not be used when sliding_window_size is set");
-        attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+        // Default to causal sliding window if the user did not explicitly set the mask type to bidirectional sliding
+        // window
+        if (attention_mask_type != Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW)
+        {
+            attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+        }
     }
     // Chunked attention.
     if (chunked_attention_size > 0)
     {
         assert((chunked_attention_size & (chunked_attention_size - 1)) == 0
             && "chunked_attention_size has to be a power of 2");
+        assert(attention_mask_type != Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW
+            && "Bidirectional sliding window attention should not use chunked attention");
         attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
     }
 
@@ -1040,14 +1084,14 @@ int main(int argc, char** argv)
     Launch_params launch_params;
     determine_launch_params(launch_params, data_type, sm, s, d, attention_mask_type, input_layout, interleaved,
         ignore_b1opt, force_unroll, use_tma, force_non_flash_attention, force_non_warp_specialization,
-        force_non_granular_tiling, force_fp32_acc, props);
+        force_non_granular_tiling, force_fp32_acc, skip_softmax_threshold_scale_factor, props);
 
     // The Q, K and V matrices are packed into one big matrix of size S x B x H x 3 x D.
-    size_t const qkv_size = s * b * h * (2 * d + dv);
+    const size_t qkv_size = s * b * h * (2 * d + dv);
     // Allocate on the host.
     float* qkv_h = (float*) malloc(qkv_size * sizeof(float));
     // The size in bytes.
-    size_t const qkv_size_in_bytes = get_size_in_bytes(qkv_size, data_type);
+    const size_t qkv_size_in_bytes = get_size_in_bytes(qkv_size, data_type);
     // Allocate on the device.
     void *qkv_sbh3d_d = nullptr, *qkv_bsh3d_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&qkv_sbh3d_d, qkv_size_in_bytes));
@@ -1057,7 +1101,7 @@ int main(int argc, char** argv)
     // The shape is [B, 2, S, H, D].
     const size_t kv_size = b * s * h_kv * (d + dv);
     // The size in bytes.
-    size_t const kv_size_in_bytes = get_size_in_bytes(kv_size, data_type);
+    const size_t kv_size_in_bytes = get_size_in_bytes(kv_size, data_type);
     // Allocate on the host.
     void* contiguous_kv_h = malloc(kv_size_in_bytes);
     // Memset the buffer.
@@ -1071,13 +1115,13 @@ int main(int argc, char** argv)
     void** kv_cache_ptrs_h = nullptr;
     void* kv_cache_pool_ptr = nullptr;
     int32_t *kv_cache_block_offsets_h, *kv_cache_block_offsets_d = nullptr;
-    size_t const max_blocks_per_seq = (s + tokens_per_block - 1) / tokens_per_block;
-    size_t const num_total_blocks = b * 2 * max_blocks_per_seq;
+    const size_t max_blocks_per_seq = (s + tokens_per_block - 1) / tokens_per_block;
+    const size_t num_total_blocks = b * 2 * max_blocks_per_seq;
     kv_cache_ptrs_h = (void**) malloc(num_total_blocks * sizeof(void*));
     kv_cache_block_offsets_h = (int32_t*) malloc(num_total_blocks * sizeof(int32_t));
-    size_t const paged_kv_block_size_in_bytes = get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type);
+    const size_t paged_kv_block_size_in_bytes = get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type);
     FMHA_CHECK_CUDA(cudaMalloc((void**) (&kv_cache_block_offsets_d), num_total_blocks * sizeof(int32_t)));
-    size_t const kv_cache_pool_sz
+    const size_t kv_cache_pool_sz
         = get_size_in_bytes(num_total_blocks * tokens_per_block * h_kv * (d + dv) / 2, data_type);
     FMHA_CHECK_CUDA(cudaMalloc((void**) (&kv_cache_pool_ptr), kv_cache_pool_sz));
     size_t ptr_index = 0;
@@ -1104,7 +1148,7 @@ int main(int argc, char** argv)
 
     // Q will always be [B, S, H, Dh] with paged kv cache.
     void* q_d;
-    size_t const q_size = s * b * h * d;
+    const size_t q_size = s * b * h * d;
     FMHA_CHECK_CUDA(cudaMalloc(&q_d, get_size_in_bytes(q_size, data_type)));
 
     // K has [B, S, H_kv, D] with separate kv cache.
@@ -1122,11 +1166,11 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cudaMalloc(&scale_bmm2_d, sizeof(uint32_t)));
 
     // The mask for dropout or any mask patterns.
-    size_t const mask_size = s * b * s;
+    const size_t mask_size = s * b * s;
     // Allocate on the host.
     float* mask_h = (float*) malloc(mask_size * sizeof(float));
     // The size in bytes.
-    size_t const mask_size_in_bytes = get_size_in_bytes(mask_size, DATA_TYPE_INT8);
+    const size_t mask_size_in_bytes = get_size_in_bytes(mask_size, DATA_TYPE_INT8);
     // Allocate on the device.
     void* mask_d = nullptr;
     if (!skip_checks)
@@ -1158,7 +1202,7 @@ int main(int argc, char** argv)
         v1 ? 1 : 2);
 
     // The number of threads per CTA.
-    size_t const threads_per_cta = warps_m * warps_n * warps_k * 32;
+    const size_t threads_per_cta = warps_m * warps_n * warps_k * 32;
     // The number of mmas in the M dimension. We use one uint32_t per MMA in the M dimension.
     size_t mmas_m = (s + 16 * warps_m - 1) / (16 * warps_m);
     // The number of mmas in the N dimension.
@@ -1182,7 +1226,7 @@ int main(int argc, char** argv)
         packed_mask_size = b * mmas_m * mmas_n * threads_per_cta;
     }
     // The size in bytes.
-    size_t const packed_mask_size_in_bytes = packed_mask_size * sizeof(uint32_t);
+    const size_t packed_mask_size_in_bytes = packed_mask_size * sizeof(uint32_t);
     // Allocate on the host.
     uint32_t* packed_mask_h = (uint32_t*) malloc(packed_mask_size_in_bytes);
     // Set it to 0 (indicates that all elements are valid).
@@ -1190,23 +1234,41 @@ int main(int argc, char** argv)
     // Allocate on the device.
     void* packed_mask_d = nullptr;
 
+    // The size of the attention sinks.
+    const size_t attention_sinks_size_in_bytes = h * sizeof(float);
+
+    // The attention sinks.
+    void* attention_sinks_d = nullptr;
+    if (use_attention_sinks)
+    {
+        // Allocate on the host.
+        float* attention_sinks_h = (float*) malloc(attention_sinks_size_in_bytes);
+        // Randomly initialize the attention sinks.
+        random_init("attention_sinks", attention_sinks_h, 1, h, 1, false, 5.f, 1.f, verbose);
+        // Allocate on the device.
+        FMHA_CHECK_CUDA(cudaMalloc(&attention_sinks_d, attention_sinks_size_in_bytes));
+        // Copy from the host to the device.
+        FMHA_CHECK_CUDA(
+            cudaMemcpy(attention_sinks_d, attention_sinks_h, attention_sinks_size_in_bytes, cudaMemcpyDefault));
+    }
+
     // The O matrix is packed as S * B * H * D.
-    size_t const o_size = s * b * h * dv;
+    const size_t o_size = s * b * h * dv;
     // Allocate on the host.
     float* o_h = (float*) malloc(o_size * sizeof(float));
     // The size in bytes.
-    size_t const o_size_in_bytes = get_size_in_bytes(o_size, data_type);
+    const size_t o_size_in_bytes = get_size_in_bytes(o_size, data_type);
     // Allocate on the device.
     void* o_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&o_d, o_size_in_bytes));
 
-    // The softmax_stats_d vector is used to store the sum/max of the softmax per token
+    // The softmax_stats_d vector is used to store the max/sum of the softmax per token
     void* softmax_stats_d;
     FMHA_CHECK_CUDA(cudaMalloc(&softmax_stats_d, 2 * sizeof(float) * b * s * h));
     FMHA_CHECK_CUDA(cudaMemset(softmax_stats_d, 0x00, 2 * sizeof(float) * b * s * h));
 
     // The size in bytes.
-    size_t const tmp_size_in_bytes = get_size_in_bytes(o_size, acc_type);
+    const size_t tmp_size_in_bytes = get_size_in_bytes(o_size, acc_type);
     // Allocate on the device.
     void* tmp_d = nullptr;
     if (data_type != acc_type)
@@ -1216,13 +1278,13 @@ int main(int argc, char** argv)
 
     // Allocate the reference on the host.
     float* o_ref_h = (float*) malloc(o_size * sizeof(float));
-    float* softmax_sum_ref_h = (float*) malloc(b * s * h * sizeof(float));
-    float* softmax_sum_h = (float*) malloc(b * s * h * sizeof(float));
+    float* softmax_stats_ref_h = (float*) malloc(2 * b * s * h * sizeof(float));
+    float* softmax_stats_h = (float*) malloc(2 * b * s * h * sizeof(float));
 
     // The P matrix is stored as one big matrix of size S x B x H x S.
-    size_t const p_size = s * b * h * s;
+    const size_t p_size = s * b * h * s;
     // The size in bytes.
-    size_t const p_size_in_bytes = get_size_in_bytes(p_size, acc_type);
+    const size_t p_size_in_bytes = get_size_in_bytes(p_size, acc_type);
     // Allocate on the device.
     void* p_d = nullptr;
     if (!skip_checks)
@@ -1238,7 +1300,7 @@ int main(int argc, char** argv)
 #endif // defined(STORE_P)
 
     // The size in bytes of the S matrix (the data type may be different from P for int8).
-    size_t const s_size_in_bytes = get_size_in_bytes(p_size, data_type);
+    const size_t s_size_in_bytes = get_size_in_bytes(p_size, data_type);
     // Allocate on the device.
     void* s_d = nullptr;
     if (!skip_checks)
@@ -1327,7 +1389,7 @@ int main(int argc, char** argv)
 
     std::vector<uint32_t> seqlens(b, 0); // randomly draw a batch of sequence lengths >= min_s
     std::transform(seqlens.begin(), seqlens.end(), seqlens.begin(),
-        [=](uint32_t const)
+        [=](const uint32_t)
         {
             if (fix_s)
             {
@@ -1415,7 +1477,7 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cudaMalloc(&mqa_qkv_packed_d, mqa_qkv_packed_size_in_bytes));
     FMHA_CHECK_CUDA(cudaMalloc(&mqa_qkv_d, mqa_qkv_size_in_bytes));
 
-    size_t const o_packed_size = cu_seqlens.back() * h * dv;
+    const size_t o_packed_size = cu_seqlens.back() * h * dv;
     // Allocate on the host.
     float* o_packed_h = (float*) malloc(o_packed_size * sizeof(float));
     void* o_packed_d = nullptr;
@@ -1581,6 +1643,11 @@ int main(int argc, char** argv)
                         valid = valid && (si >= std::max(int(so + 1 - sliding_window_size), 0));
                     }
                 }
+                else if (attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW)
+                {
+                    valid = valid && si >= std::max(int(so - sliding_window_size / 2), 0);
+                    valid = valid && si <= std::min(int(so + sliding_window_size / 2), int(actual_seqlen - 1));
+                }
                 if (is_mtp)
                 {
                     // Only the last s_q tokens are used for verifying the results.
@@ -1676,9 +1743,15 @@ int main(int argc, char** argv)
         total, num_grouped_heads, sliding_window_size, chunked_attention_size,
         // Paged kv cache.
         tokens_per_block, qkv_d_view, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr, kv_cache_block_offsets_d,
-        packed_mask_d, cu_mask_rows_d, cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d, softmax_stats_ptr,
-        scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2, softcapping_scale_bmm1, use_int8_scale_max, interleaved,
-        is_s_padded, has_alibi);
+        packed_mask_d, cu_mask_rows_d, attention_sinks_d, cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d,
+        softmax_stats_ptr, scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2, softcapping_scale_bmm1,
+        use_int8_scale_max, interleaved, is_s_padded, has_alibi, skip_softmax_threshold_scale_factor);
+#ifdef SKIP_SOFTMAX_STAT
+    FMHA_CHECK_CUDA(cudaMalloc(&params_v2.skip_softmax_total_blocks, sizeof(uint32_t)));
+    FMHA_CHECK_CUDA(cudaMalloc(&params_v2.skip_softmax_skipped_blocks, sizeof(uint32_t)));
+    FMHA_CHECK_CUDA(cudaMemset(params_v2.skip_softmax_total_blocks, 0, sizeof(uint32_t)));
+    FMHA_CHECK_CUDA(cudaMemset(params_v2.skip_softmax_skipped_blocks, 0, sizeof(uint32_t)));
+#endif
 
     // total number of tokens is needed to set TMA desc on the host.
     launch_params.total_q_seqlen = q_seqlens[b];
@@ -1894,8 +1967,8 @@ int main(int argc, char** argv)
         ground_truth(bmm1, bmm2, data_type, acc_type, scale_bmm1, scale_softmax, scale_bmm2, softcapping_scale_bmm1,
             qkv_sbh3d_d,
             vt_d, // WAR pass in V'
-            mask_d, p_d, s_d, tmp_d, o_d, softmax_stats_d, cu_seqlens_d, b, s, h, d, dv, runs, warps_m, warps_n,
-            has_alibi);
+            mask_d, attention_sinks_d, p_d, s_d, tmp_d, o_d, softmax_stats_d, cu_seqlens_d, b, s, h, d, dv, runs,
+            warps_m, warps_n, has_alibi);
         timer.stop();
         FMHA_CHECK_CUDA(cudaPeekAtLastError());
         FMHA_CHECK_CUDA(cudaDeviceSynchronize());
@@ -1911,7 +1984,7 @@ int main(int argc, char** argv)
 
         // Read the results.
         FMHA_CHECK_CUDA(cuda_memcpy_d2h(o_ref_h, o_d, o_size, data_type));
-        FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_sum_ref_h, softmax_stats_d, b * s * h, DATA_TYPE_FP32));
+        FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_stats_ref_h, softmax_stats_d, 2 * b * s * h, DATA_TYPE_FP32));
     }
 
     // Fill-in p/s/o with garbage data.
@@ -1997,7 +2070,7 @@ int main(int argc, char** argv)
             std::vector<float> o_ref_trans_h(o_size);
 
             FMHA_CHECK_CUDA(cuda_memcpy_d2h(o_h, o_d_view, o_view_size, output_dtype));
-            FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_sum_h, softmax_stats_d, b * s * h, DATA_TYPE_FP32));
+            FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_stats_h, softmax_stats_d, 2 * b * s * h, DATA_TYPE_FP32));
 
             if (interleaved)
             {
@@ -2009,7 +2082,6 @@ int main(int argc, char** argv)
             // Extract the last s_q tokens from the output.
             extract_and_transpose_output<float>(
                 o_ref_trans_h.data(), o_ref_h, seqlens, q_seqlens, s, s_q, b, h, dv, is_s_padded);
-
             if (verbose)
             {
                 printf("\nChecking .....: O = V * S\n");
@@ -2018,8 +2090,8 @@ int main(int argc, char** argv)
                 dv, epsilon, verbose, true);
             if (save_softmax)
             {
-                int errors = check_softmax_results(softmax_sum_h, softmax_sum_ref_h, b, s, h, seqlens, cu_seqlens);
-                status = status | (errors > 0);
+                auto errors = check_softmax_results(softmax_stats_h, softmax_stats_ref_h, b, s, h, seqlens, cu_seqlens);
+                status = status | ((errors.first + errors.second) > 0);
             }
         }
         if (status != 0)
@@ -2067,6 +2139,18 @@ int main(int argc, char** argv)
             non_fused_elapsed / fused_elapsed, total_flops / (fused_elapsed / float(runs) / 1e-9),
             total_bytes / (fused_elapsed / float(runs) / 1e-6));
     }
+#ifdef SKIP_SOFTMAX_STAT
+    if (skip_softmax_threshold_scale_factor > 0)
+    {
+        uint32_t total_blocks, skipped_blocks;
+        FMHA_CHECK_CUDA(
+            cudaMemcpy(&total_blocks, params_v2.skip_softmax_total_blocks, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        FMHA_CHECK_CUDA(cudaMemcpy(
+            &skipped_blocks, params_v2.skip_softmax_skipped_blocks, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        printf("Skip-Softmax .: %u / %u = %.2f%%\n", skipped_blocks, total_blocks,
+            total_blocks ? 100.f * skipped_blocks / total_blocks : 0.f);
+    }
+#endif
 #if defined(DEBUG_HAS_PRINT_BUFFER)
     FMHA_CHECK_CUDA(cuda_memcpy_d2h(print_buffer.data(), params.print_ptr, print_buffer.size(), DATA_TYPE_FP32));
 
@@ -2107,6 +2191,11 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cudaFree(kv_cache_block_offsets_d));
     FMHA_CHECK_CUDA(cudaFree(contiguous_kv_d));
     FMHA_CHECK_CUDA(cudaFree(softmax_stats_d));
+    FMHA_CHECK_CUDA(cudaFree(attention_sinks_d));
+#ifdef SKIP_SOFTMAX_STAT
+    FMHA_CHECK_CUDA(cudaFree(params_v2.skip_softmax_total_blocks));
+    FMHA_CHECK_CUDA(cudaFree(params_v2.skip_softmax_skipped_blocks));
+#endif
 
     free(qkv_h);
     free(mask_h);
@@ -2114,8 +2203,8 @@ int main(int argc, char** argv)
     free(s_h);
     free(o_h);
     free(o_ref_h);
-    free(softmax_sum_h);
-    free(softmax_sum_ref_h);
+    free(softmax_stats_h);
+    free(softmax_stats_ref_h);
     free(contiguous_kv_h);
     free(kv_cache_ptrs_h);
     free(kv_cache_block_offsets_h);

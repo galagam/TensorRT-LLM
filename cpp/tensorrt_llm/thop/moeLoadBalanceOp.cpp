@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/moeCommKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -29,6 +28,8 @@
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -201,6 +202,8 @@ void migrateToHostAccessible(at::Tensor& tensor)
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("moe_load_balance_wait_gpu_stage(int single_layer_load_balancer_ptr) -> Tensor");
@@ -208,7 +211,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("moe_load_balance_wait_gpu_stage", &torch_ext::moeLoadBalanceWaitGpuStage);
+    m.impl("moe_load_balance_wait_gpu_stage", &tensorrt_llm::torch_ext::moeLoadBalanceWaitGpuStage);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -218,7 +221,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("moe_load_balance_set_cpu_stage", &torch_ext::moeLoadBalanceSetCpuStage);
+    m.impl("moe_load_balance_set_cpu_stage", &tensorrt_llm::torch_ext::moeLoadBalanceSetCpuStage);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -230,7 +233,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_load_balance_statistic", &torch_ext::moeLoadBalanceStatistic);
+    m.impl("moe_load_balance_statistic", &tensorrt_llm::torch_ext::moeLoadBalanceStatistic);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -243,7 +246,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_hierarchical_statistic_local_device", &torch_ext::moeHierarchicalStatisticLocalDevice);
+    m.impl("moe_hierarchical_statistic_local_device", &tensorrt_llm::torch_ext::moeHierarchicalStatisticLocalDevice);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -255,7 +258,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_hierarchical_statistic_update", &torch_ext::moeHierarchicalStatisticUpdate);
+    m.impl("moe_hierarchical_statistic_update", &tensorrt_llm::torch_ext::moeHierarchicalStatisticUpdate);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -267,7 +270,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_load_balance_routing", &torch_ext::moeLoadBalanceRouting);
+    m.impl("moe_load_balance_routing", &tensorrt_llm::torch_ext::moeLoadBalanceRouting);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -277,5 +280,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("migrate_to_host_accessible", &torch_ext::migrateToHostAccessible);
+    m.impl("migrate_to_host_accessible", &tensorrt_llm::torch_ext::migrateToHostAccessible);
 }

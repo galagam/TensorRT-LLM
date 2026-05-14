@@ -18,6 +18,27 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
+async def _iter_sse_data(response_content):
+    """Yield SSE data payloads from a byte stream.
+
+    Buffers incoming bytes on newline boundaries, decodes UTF-8, strips
+    non-data lines and the ``data:`` prefix, and skips ``[DONE]`` sentinels.
+    Callers receive only JSON-ready strings.
+    """
+    buf = b""
+    async for chunk in response_content.iter_any():
+        buf += chunk
+        while b"\n" in buf:
+            line_bytes, buf = buf.split(b"\n", 1)
+            line = line_bytes.decode("utf-8").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line.removeprefix("data:").lstrip()
+            if payload == "[DONE]":
+                continue
+            yield payload
+
+
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -30,6 +51,7 @@ class RequestFuncInput:
     extra_body: Optional[dict] = None
     ignore_eos: bool = False
     language: Optional[str] = None
+    multi_modal_content: Optional[dict] = None
 
 
 @dataclass
@@ -44,7 +66,8 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
-    decode_iteration: int = 0  # Number of decoding iterations
+    avg_decoded_tokens_per_iter: float = 0.0  # Average tokens decoded per iteration
+    exception_type: str = None  # unset
 
 
 async def async_request_trt_llm(
@@ -54,7 +77,10 @@ async def async_request_trt_llm(
     session: Optional[aiohttp.ClientSession] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith("generate_stream")
+    if not api_url.endswith("generate_stream"):
+        raise ValueError(
+            f"TRT-LLM API URL must end with 'generate_stream', but got: {api_url}"
+        )
 
     request_session = aiohttp.ClientSession(
         trust_env=True,
@@ -78,20 +104,12 @@ async def async_request_trt_llm(
     ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url, json=payload) as response:
             if response.status == 200:
                 output.success = True
                 if streaming:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data:")
-
+                    async for chunk in _iter_sse_data(response.content):
                         data = json.loads(chunk)
                         output.generated_text += data["text_output"]
                         timestamp = time.perf_counter()
@@ -104,12 +122,15 @@ async def async_request_trt_llm(
                         else:
                             output.itl.append(timestamp - most_recent_timestamp)
 
-                        # Increment decode iteration for each chunk
-                        decode_iteration_count += 1
                         most_recent_timestamp = timestamp
 
+                        # Extract avg_decoded_tokens_per_iter from TensorRT-LLM response
+                        if "avg_decoded_tokens_per_iter" in data:
+                            output.avg_decoded_tokens_per_iter = data[
+                                "avg_decoded_tokens_per_iter"]
+
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
+
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -117,23 +138,27 @@ async def async_request_trt_llm(
                     output.itl = []
                     output.generated_text = data["text_output"]
                     output.latency = time.perf_counter() - st
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = len(output.generated_text.split(
-                    )) if output.generated_text else 1
+
+                    # Extract avg_decoded_tokens_per_iter from non-streaming TensorRT-LLM response
+                    if "avg_decoded_tokens_per_iter" in data:
+                        output.avg_decoded_tokens_per_iter = data[
+                            "avg_decoded_tokens_per_iter"]
 
             else:
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+        output.exception_type = e.__class__.__name__
     finally:
         if session is None:
             await request_session.close()
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
@@ -144,9 +169,10 @@ async def async_request_openai_completions(
     session: Optional[aiohttp.ClientSession] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        ("completions", "profile")
-    ), "OpenAI Completions API URL must end with 'completions' or 'profile'."
+    if not api_url.endswith(("completions", "profile")):
+        raise ValueError(
+            "OpenAI Completions API URL must end with 'completions' or 'profile'."
+        )
 
     request_session = aiohttp.ClientSession(
         trust_env=True,
@@ -178,7 +204,6 @@ async def async_request_openai_completions(
     generated_text = ""
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -186,43 +211,38 @@ async def async_request_openai_completions(
             if response.status == 200:
                 if streaming:
                     first_chunk_received = False
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+                    async for chunk in _iter_sse_data(response.content):
+                        data = json.loads(chunk)
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
-                        if chunk != "[DONE]":
-                            data = json.loads(chunk)
+                        # NOTE: Some completion API might have a last
+                        # usage summary response without a token so we
+                        # want to check a token was generated
+                        if choices := data.get("choices"):
+                            # Note that text could be empty here
+                            # e.g. for special tokens
+                            text = choices[0].get("text")
+                            timestamp = time.perf_counter()
+                            # First token
+                            if not first_chunk_received:
+                                first_chunk_received = True
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if choices := data.get("choices"):
-                                # Note that text could be empty here
-                                # e.g. for special tokens
-                                text = choices[0].get("text")
-                                timestamp = time.perf_counter()
-                                # First token
-                                if not first_chunk_received:
-                                    first_chunk_received = True
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp -
+                                                  most_recent_timestamp)
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp -
-                                                      most_recent_timestamp)
+                            most_recent_timestamp = timestamp
+                            generated_text += text or ""
 
-                                # Increment decode iteration for each chunk with text
-                                if text is not None:
-                                    decode_iteration_count += 1
-                                most_recent_timestamp = timestamp
-                                generated_text += text or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get(
-                                    "completion_tokens")
+                            # Extract avg_decoded_tokens_per_iter from streaming response
+                            if "avg_decoded_tokens_per_iter" in choices[0]:
+                                output.avg_decoded_tokens_per_iter = choices[0][
+                                    "avg_decoded_tokens_per_iter"]
+                        elif usage := data.get("usage"):
+                            output.output_tokens = usage.get(
+                                "completion_tokens")
                     if first_chunk_received:
                         output.success = True
                     else:
@@ -232,7 +252,6 @@ async def async_request_openai_completions(
                             "This response will be marked as failed!")
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -243,21 +262,27 @@ async def async_request_openai_completions(
                     output.ttft = -1
                     output.itl = []
                     output.output_tokens = data["usage"]["completion_tokens"]
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = output.output_tokens if output.output_tokens > 0 else 1
+                    # Extract avg_decoded_tokens_per_iter if available
+                    choice = data["choices"][0]
+                    if "avg_decoded_tokens_per_iter" in choice:
+                        output.avg_decoded_tokens_per_iter = choice[
+                            "avg_decoded_tokens_per_iter"]
             else:
+                print(f"HTTP Error {response.status}: {response}")
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+        output.exception_type = e.__class__.__name__
     finally:
         if session is None:
             await request_session.close()
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
@@ -268,9 +293,9 @@ async def async_request_openai_chat_completions(
     session: Optional[aiohttp.ClientSession] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        ("chat/completions", "profile"
-         )), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    if not api_url.endswith(("chat/completions", "profile")):
+        raise ValueError(
+            "OpenAI Chat Completions API URL must end with 'chat/completions'.")
 
     request_session = aiohttp.ClientSession(
         trust_env=True,
@@ -292,16 +317,12 @@ async def async_request_openai_chat_completions(
         [isinstance(i, int) for i in request_func_input.prompt]):
         payload["prompt_token_ids"] = request_func_input.prompt
     else:
-        assert isinstance(request_func_input.prompt,
-                          str), "Prompt must be a string or a list of integers"
-        payload["messages"].append({
-            "role":
-            "user",
-            "content": [{
-                "type": "text",
-                "text": request_func_input.prompt
-            }]
-        })
+        if not isinstance(request_func_input.prompt, str):
+            raise ValueError("Prompt must be a string or a list of integers")
+        content = [{"type": "text", "text": request_func_input.prompt}]
+        if request_func_input.multi_modal_content:
+            content.extend(request_func_input.multi_modal_content)
+        payload["messages"].append({"role": "user", "content": content})
 
     if streaming:
         payload["stream_options"] = {"include_usage": True}
@@ -321,7 +342,6 @@ async def async_request_openai_chat_completions(
     ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -329,42 +349,36 @@ async def async_request_openai_chat_completions(
             if response.status == 200:
                 output.success = True
                 if streaming:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+                    async for chunk in _iter_sse_data(response.content):
+                        timestamp = time.perf_counter()
+                        data = json.loads(chunk)
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
-                        if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
-                            data = json.loads(chunk)
+                        if choices := data.get("choices"):
+                            content = choices[0]["delta"].get("content")
+                            # First token
+                            if ttft == 0.0:
+                                ttft = timestamp - st
+                                output.ttft = ttft
 
-                            if choices := data.get("choices"):
-                                content = choices[0]["delta"].get("content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp -
+                                                  most_recent_timestamp)
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp -
-                                                      most_recent_timestamp)
+                            generated_text += content or ""
 
-                                # Increment decode iteration for each chunk with content
-                                if content is not None:
-                                    decode_iteration_count += 1
-                                generated_text += content or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get(
-                                    "completion_tokens")
+                            # Extract avg_decoded_tokens_per_iter from streaming chat response
+                            if "avg_decoded_tokens_per_iter" in choices[0]:
+                                output.avg_decoded_tokens_per_iter = choices[0][
+                                    "avg_decoded_tokens_per_iter"]
+                        elif usage := data.get("usage"):
+                            output.output_tokens = usage.get(
+                                "completion_tokens")
 
-                            most_recent_timestamp = timestamp
+                        most_recent_timestamp = timestamp
 
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -374,22 +388,29 @@ async def async_request_openai_chat_completions(
                     output.itl = []
                     output.latency = time.perf_counter() - st
                     output.ttft = -1
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = output.output_tokens if output.output_tokens > 0 else 1
+
+                    # Extract avg_decoded_tokens_per_iter if available
+                    choice = data["choices"][0]
+                    if "avg_decoded_tokens_per_iter" in choice:
+                        output.avg_decoded_tokens_per_iter = choice[
+                            "avg_decoded_tokens_per_iter"]
 
             else:
+                # TODO: Need to store the status code to debug and report
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+        output.exception_type = e.__class__.__name__
     finally:
         if session is None:
             await request_session.close()
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
@@ -397,6 +418,7 @@ def get_tokenizer(
     pretrained_model_name_or_path: str,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
+    custom_tokenizer: str = None,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     if tokenizer_mode == "slow":
@@ -404,6 +426,25 @@ def get_tokenizer(
             raise ValueError(
                 "Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+    if custom_tokenizer:
+        from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
+
+        tokenizer_path = TOKENIZER_ALIASES.get(custom_tokenizer,
+                                               custom_tokenizer)
+        from importlib import import_module
+        try:
+            module_path, class_name = tokenizer_path.rsplit('.', 1)
+            module = import_module(module_path)
+            tokenizer_class = getattr(module, class_name)
+            return tokenizer_class.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+        except (ValueError, ImportError, AttributeError) as e:
+            raise ValueError(
+                f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
+                "Expected alias or 'module.path.ClassName'.") from e
     return AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path,
         trust_remote_code=trust_remote_code,

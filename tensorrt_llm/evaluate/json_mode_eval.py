@@ -18,6 +18,7 @@ from typing import Iterable, List, Optional, Union
 
 import click
 import datasets
+import jsonschema
 import numpy as np
 
 from .. import LLM as PyTorchLLM
@@ -35,13 +36,15 @@ class JsonModeEval(Evaluator):
                  num_samples: Optional[int] = None,
                  random_seed: int = 0,
                  apply_chat_template: bool = True,
-                 system_prompt: Optional[str] = None):
+                 system_prompt: Optional[str] = None,
+                 output_dir: Optional[str] = None):
         if not apply_chat_template:
             raise ValueError(
                 f"{self.__class__.__name__} requires apply_chat_template=True.")
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         output_dir=output_dir)
         if dataset_path is None:
             dataset_path = "NousResearch/json-mode-eval"
         self.data = datasets.load_dataset(dataset_path,
@@ -65,23 +68,30 @@ class JsonModeEval(Evaluator):
             sampling_args = {
                 "guided_decoding": GuidedDecodingParams(json=schema)
             }
-            yield sample["prompt"], sampling_args, sample["completion"]
+            yield sample["prompt"], sampling_args, sample["completion"], sample[
+                "schema"]
 
-    def compute_score(self, outputs: List[RequestOutput],
-                      references: List[str]) -> float:
-        all_corrections = []
-        for output, ref in zip(outputs, references):
+    def compute_score(self, outputs: List[RequestOutput], references: List[str],
+                      schemas: List[str]) -> float:
+        all_corrections, all_grammar_corrections = [], []
+        for output, ref, schema in zip(outputs, references, schemas):
             try:
                 output_json = json.loads(output.outputs[0].text)
-            except json.JSONDecodeError:
+                jsonschema.validate(output_json, json.loads(schema))
+            except (json.JSONDecodeError, jsonschema.ValidationError):
                 all_corrections.append(False)
+                all_grammar_corrections.append(False)
                 continue
-            ref_json = json.loads(ref)
-            all_corrections.append(output_json == ref_json)
+            all_corrections.append(output_json == json.loads(ref))
+            all_grammar_corrections.append(True)
 
         acc = np.mean(all_corrections) * 100
         logger.info(
             f"JSON Mode Eval accuracy: {acc:.2f} ({len(all_corrections)})")
+        grammar_acc = np.mean(all_grammar_corrections) * 100
+        logger.info(
+            f"JSON Mode Eval grammar accuracy: {grammar_acc:.2f} ({len(all_grammar_corrections)})"
+        )
         return acc
 
     @click.command("json_mode_eval")
@@ -112,11 +122,16 @@ class JsonModeEval(Evaluator):
                   type=int,
                   default=512,
                   help="Maximum generation length.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
                 random_seed: int, system_prompt: Optional[str],
-                max_input_length: int, max_output_length: int) -> None:
+                max_input_length: int, max_output_length: int,
+                output_dir: Optional[str]) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -125,6 +140,7 @@ class JsonModeEval(Evaluator):
                                  num_samples=num_samples,
                                  random_seed=random_seed,
                                  apply_chat_template=True,
-                                 system_prompt=system_prompt)
+                                 system_prompt=system_prompt,
+                                 output_dir=output_dir)
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

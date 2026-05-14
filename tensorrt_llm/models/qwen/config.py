@@ -14,6 +14,7 @@
 # limitations under the License.
 from typing import Optional, Union
 
+from ..._utils import get_hf_rope_theta
 from ...layers import MoeConfig
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
@@ -32,6 +33,8 @@ class QWenConfig(PretrainedConfig):
                  use_logn_attn: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
                  num_labels: int = 1,
+                 mlp_only_layers: Optional[list] = None,
+                 decoder_sparse_step: int = 1,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -40,6 +43,8 @@ class QWenConfig(PretrainedConfig):
         self.disable_weight_only_quant_plugin = disable_weight_only_quant_plugin
         self.num_labels = num_labels
         self.use_logn_attn = use_logn_attn
+        self.mlp_only_layers = mlp_only_layers or []
+        self.decoder_sparse_step = decoder_sparse_step
         if moe is None:
             # Legacy MOE config fields
             moe = MoeConfig(num_experts=kwargs.pop('moe_num_experts', 0),
@@ -64,6 +69,8 @@ class QWenConfig(PretrainedConfig):
         output[
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
         output['use_logn_attn'] = self.use_logn_attn
+        output['mlp_only_layers'] = self.mlp_only_layers
+        output['decoder_sparse_step'] = self.decoder_sparse_step
         output['moe'] = self.moe.to_dict()
         return output
 
@@ -114,7 +121,7 @@ class QWenConfig(PretrainedConfig):
             hf_config.hidden_size // hf_config.num_attention_heads)
         head_size = getattr(hf_config, "kv_channels", head_dim)
         hidden_act = getattr(hf_config, "hidden_act", "silu")
-        if qwen_type == "qwen2_moe":
+        if qwen_type in ("qwen2_moe", "qwen3_moe"):
             hidden_act = "swiglu"
 
         # Qwen3 models have no attention bias, while legacy models have bias
@@ -132,7 +139,7 @@ class QWenConfig(PretrainedConfig):
             rotary_base = getattr(hf_config, "rotary_emb_base", 10000.0)
         else:
             rms_norm_eps = hf_config.rms_norm_eps
-            rotary_base = getattr(hf_config, "rope_theta", 100000.0)
+            rotary_base = get_hf_rope_theta(hf_config, 100000.0)
 
         num_labels = 1
         if hf_config.architectures[0] == "Qwen2ForSequenceClassification":
@@ -144,6 +151,11 @@ class QWenConfig(PretrainedConfig):
         moe_shared_expert_intermediate_size = getattr(
             hf_config, "shared_expert_intermediate_size", 0)
         moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.NONE
+
+        # Add support for mlp_only_layers and decoder_sparse_step (Qwen3 MoE)
+        mlp_only_layers = getattr(hf_config, "mlp_only_layers", [])
+        decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", 1)
+
         moe_config = MoeConfig(num_experts=moe_num_experts,
                                top_k=moe_top_k,
                                normalization_mode=moe_normalization_mode)
@@ -189,6 +201,8 @@ class QWenConfig(PretrainedConfig):
             moe_intermediate_size=moe_intermediate_size,
             moe_shared_expert_intermediate_size=
             moe_shared_expert_intermediate_size,
+            mlp_only_layers=mlp_only_layers,
+            decoder_sparse_step=decoder_sparse_step,
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,

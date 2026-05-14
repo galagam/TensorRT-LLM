@@ -18,11 +18,13 @@
 
 #include "tensorrt_llm/executor/executor.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -36,7 +38,8 @@ using BlockPtr = std::shared_ptr<KVCacheBlock>;
 class KVCacheEventManager
 {
 public:
-    explicit KVCacheEventManager(size_t maxKVEventEntries);
+    explicit KVCacheEventManager(size_t maxKVEventEntries, std::optional<SizeType32> attentionDpRank = std::nullopt,
+        std::optional<SizeType32> attentionDpSize = std::nullopt, SizeType32 attentionDpEventsGatherPeriodMs = 5);
 
     ~KVCacheEventManager();
     KVCacheEventManager(KVCacheEventManager& other) = delete;
@@ -61,14 +64,21 @@ public:
     // Worker thread which adds events to mEvents.
     void worker();
 
+    // Thread which exchanges events if attentionDP is enabled
+    void exchangeAttentionDpThread();
+
 private:
     // Add an event to mEventQueue
     void enqueueEvent(executor::KVCacheEvent&& event);
 
+    void flushRemovedEvents(SizeType32 windowSize);
+
     /// @brief Flag to terminate the worker
-    bool mRun;
+    std::atomic<bool> mRun;
     /// @brief Worker thread
     std::thread mWorkerThread;
+    /// @brief Exchange thread for attention DP events
+    std::thread mExchangeAttentionDpThread;
 
     /// @brief The deque of events
     std::deque<executor::KVCacheEvent> mEvents;
@@ -91,6 +101,19 @@ private:
     size_t mMaxSize;
     /// @brief An auto-incrementing event id counter
     size_t mEventId;
+
+    std::unordered_map<SizeType32, std::optional<executor::KVCacheRemovedData>> mLatestRemovedEvents;
+
+    /// @brief Attention DP ranks and size
+    /// If set, we will exchange KV cache events and accumulate on rank 0
+    std::optional<SizeType32> mAttentionDpRank;
+    std::optional<SizeType32> mAttentionDpSize;
+
+    /// @brief The period in milliseconds to gather attention DP events across rank
+    SizeType32 mAttentionDpEventsGatherPeriodMs;
+
+    /// @brief MPI communicator for attention DP
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiComm;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

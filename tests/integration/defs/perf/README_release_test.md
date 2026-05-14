@@ -1,12 +1,12 @@
-# TensorRT-LLM Performance Test Flow (Default PyTorch Flow)
+# TensorRT LLM Performance Test Flow (Default PyTorch Flow)
 
 ## Overview
-This document describes the complete TensorRT-LLM performance testing workflow, particularly for the default PyTorch backend testing process for release testing.
+This document describes the complete TensorRT LLM performance testing workflow, particularly for the default PyTorch backend testing process for release testing.
 
 ## 1. Test Scripts
 
 ### Main Test Script
-The main script for TensorRT-LLM performance testing is `test_perf.py`, which is responsible for executing all performance test cases.
+The main script for TensorRT LLM performance testing is `test_perf.py`, which is responsible for executing all performance test cases.
 
 ### Performance Metrics
 For trtllm-bench, the test extracts the following key performance metrics from logs:
@@ -24,27 +24,25 @@ For trtllm-bench, the test extracts the following key performance metrics from l
 
 #### Without LoRA
 ```python
-prepare_data_script = os.path.join(self._llm_root, "benchmarks", "cpp", "prepare_dataset.py")
 data_cmd += [
-    "python3", prepare_data_script, "--stdout",
-    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
-    f"--num-requests={self._config.num_reqs}",
-    f"--input-mean={input_len}", f"--output-mean={output_len}",
-    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-    f" > {dataset_path}"
+    "trtllm-bench", f"--model={tokenizer_dir}",
+        "prepare-dataset", "--output", dataset_path, "token-norm-dist",
+        f"--num-requests={self._config.num_reqs}",
+        f"--input-mean={input_len}", f"--output-mean={output_len}",
+        f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
 ]
 ```
 
 #### With LoRA
 ```python
-"python3", prepare_data_script, f"--stdout",
+"trtllm-bench", f"--model={tokenizer_dir}",
+    "prepare-dataset", "--output", dataset_path,
     f"--rand-task-id 0 {nloras-1}",
-    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+    f"--lora-dir={lora_dir}",
     f"token-norm-dist",
     f"--num-requests={self._config.num_reqs}",
     f"--input-mean={input_len}", f"--output-mean={output_len}",
-    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-    f" > {dataset_path}"
+    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
 ```
 
 ### 2.2 PyTorch Configuration Generation
@@ -100,10 +98,10 @@ if self._config.backend == "pytorch":
     config = get_model_yaml_config(self._config.to_string(),
                                    lora_dirs=self.lora_dirs)
     print_info(f"pytorch model config: {config}")
-    with open('extra-llm-api-config.yml', 'w') as f:
+    with open('config.yml', 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
     benchmark_cmd += [
-        f"--extra_llm_api_options=extra-llm-api-config.yml"
+        f"--config=config.yml"
     ]
 ```
 
@@ -111,14 +109,39 @@ if self._config.backend == "pytorch":
 
 ### 3.1 Full Test Cycles
 
-1. **trt_llm_release_perf_test.yml** - Release performance test
-2. **trt_llm_perf_cluster_test.yml** - Cluster performance test
+1. **llm_perf_full.yml** - Release performance test
+   - [test_lists/qa/llm_perf_full.yml](../../test_lists/qa/llm_perf_full.yml)
+2. **llm_perf_cluster.yml** - Cluster performance test(for Blackwell)
+   - [test_lists/qa/llm_perf_cluster.yml](../../test_lists/qa/llm_perf_cluster.yml)
+3. **llm_perf_nim.yml** - NIM performance test
+   - [test_lists/qa/llm_perf_nim.yml](../../test_lists/qa/llm_perf_nim.yml)
 
 ### 3.2 Sanity Test Cycles
 
-- **trt_llm_release_perf_sanity.yml** - Release performance sanity test
+- **llm_perf_sanity.yml** - Release performance sanity test
+  - [test_lists/qa/llm_perf_sanity.yml](../../test_lists/qa/llm_perf_sanity.yml)
 
 ## 4. Test Configuration Description
+
+### 4.1 PyTorch Model Configuration
+
+The default PyTorch configuration is defined in [pytorch_model_config.py](pytorch_model_config.py) and can be overridden for specific test patterns. For example:
+
+```python
+{
+    'patterns': [
+        'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
+    ],
+    'config': {
+        'enable_attention_dp': False,
+        'moe_config': {
+            'backend': 'TRTLLM'
+        }
+    }
+}
+```
+
+This configuration allows you to customize PyTorch-specific settings for different model patterns while maintaining the base configuration as a fallback.
 
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files

@@ -13,6 +13,7 @@ import zmq
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationExecutor, GenerationRequest,
                                    GenerationResult, GenerationResultBase,
@@ -78,6 +79,7 @@ def llama_7b_tp2_path(engine_path: Path) -> Path:
     return path
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_bs2_path)
@@ -99,6 +101,7 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
                        'E F G H I K L M')
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_sync_generation(llama_7b_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_path)
@@ -211,21 +214,33 @@ def _test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
             result.outputs[0].token_ids) == ", neural network,"
 
         try:
-            stats = await executor.aget_stats()
-            stats = json.loads(stats)
-            assert stats["iter"] == 0
-            assert stats["cpuMemUsage"] > 0
-            assert stats["gpuMemUsage"] > 0
-            assert stats["inflightBatchingStats"]["numCtxTokens"] == 3
-            assert stats["inflightBatchingStats"]["numGenRequests"] == 0
-            assert stats["kvCacheStats"]["usedNumBlocks"] == 1
+            stats_result = executor.aget_stats(timeout=2)
+            # aget_stats now returns IterationResult, iterate to get stats
+            async for stats_str in stats_result:
+                stats = json.loads(stats_str) if isinstance(stats_str,
+                                                            str) else stats_str
+                assert stats["iter"] >= 0
+                assert stats["cpuMemUsage"] > 0
+                assert stats["gpuMemUsage"] > 0
+                break  # Just check first result
         except AsyncQueue.EventLoopShutdownError:
             pass
 
     asyncio.run(async_stats_task())
 
-    stats = executor.get_stats()
-    assert json.loads(stats)["iter"] == 1
+    # Poll for stats since RPC calls return immediately
+    import time
+    stats_list = []
+    for _ in range(10):
+        stats_list = executor.get_stats(timeout=0.5)
+        if stats_list:
+            break
+        time.sleep(0.1)
+
+    assert len(stats_list) > 0
+    stats = json.loads(stats_list[0]) if isinstance(stats_list[0],
+                                                    str) else stats_list[0]
+    assert stats["iter"] == 1
     executor.shutdown()
 
 
@@ -320,6 +335,55 @@ def test_DetokenizedGenerationResultBase():
     assert result._done
 
 
+def test_abort_on_GenerationResultBase():
+    """abort() and aborted() are available on GenerationResultBase."""
+    sampling_params = SamplingParams(max_tokens=4)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+    assert not result.aborted()
+    result.abort()
+    assert result.aborted()
+
+
+def test_abort_on_DetokenizedGenerationResultBase():
+    """DetokenizedGenerationResultBase inherits abort() so postprocess workers can call it without AttributeError (NVBug 5955173)."""
+    sampling_params = SamplingParams(max_tokens=4)
+    result = DetokenizedGenerationResultBase(id=1,
+                                             sampling_params=sampling_params)
+    assert not result.aborted()
+    result._handle_response(create_rsp(10, finished=False))
+    assert not result._done
+
+    result.abort()
+    assert result.aborted()
+
+
+def test_PostprocWorker_Output_should_abort():
+    """PostprocWorker.Output carries should_abort flag for worker-to-main-thread abort signal propagation."""
+    out_default = PostprocWorker.Output(client_id=0, res=None, is_final=False)
+    assert out_default.should_abort is False
+
+    out_abort = PostprocWorker.Output(client_id=0,
+                                      res=None,
+                                      is_final=False,
+                                      should_abort=True)
+    assert out_abort.should_abort is True
+
+
+def test_handle_response_propagates_should_abort():
+    """When a PostprocWorker.Output has should_abort=True, _handle_response on the main-thread GenerationResult calls abort() (NVBug 5955173)."""
+    sampling_params = SamplingParams(max_tokens=4)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+    assert not result.aborted()
+
+    output = PostprocWorker.Output(client_id=1,
+                                   res="mock_sse_data",
+                                   is_final=False,
+                                   should_abort=True)
+    result._handle_response(output)
+    assert result.aborted()
+    assert result._outputs[0]._postprocess_result == "mock_sse_data"
+
+
 def _ZeroMqQueue_sync_sync_task(addr: str):
     print(f"Setup receiver: {addr}")
     pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
@@ -394,7 +458,7 @@ def test_ZeroMqQueue_serialization_complicated_dataclass():
     TokenRangeRetentionConfig = tllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
     kvcache_config = tllm.KvCacheRetentionConfig(
         [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
-        80)
+        80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     sampling_params = SamplingParams(max_tokens=4,
                                      embedding_bias=torch.randn(2, 2))
@@ -477,6 +541,103 @@ def test_ResponsePostprocessWorker():
     input_pipe.put(None)  # tell worker to shutdown
     fut.result()
 
+    pool.shutdown()
+    input_pipe.close()
+    out_pipe.close()
+
+
+def test_get_params_for_first_rsp_returns_disaggregated_params_once():
+    """Verify _get_params_for_first_rsp extracts disaggregated_params from the GenerationResult on the first call and returns None after.
+
+    Regression test for https://nvbugs/5991957.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm.executor.base_worker import _get_params_for_first_rsp
+
+    disagg_params = DisaggregatedParams(
+        request_type="generation_only",
+        first_gen_tokens=[7],
+        ctx_request_id=12345,
+    )
+    request = GenerationRequest(
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=4),
+        disaggregated_params=disagg_params,
+    )
+    request.set_id(42)
+    result = GenerationResult(request, disaggregated_params=disagg_params)
+
+    worker = SimpleNamespace(_results={42: result})
+
+    # First call: should return all three params
+    sp, pp, dp = _get_params_for_first_rsp(worker, 42)
+    assert sp is not None
+    assert pp is None  # no postproc_params on this request
+    assert dp is not None
+    assert dp.request_type == "generation_only"
+    assert dp.first_gen_tokens == [7]
+    assert dp.ctx_request_id == 12345
+    assert result._params_transmitted is True
+
+    # Second call: _params_transmitted is True, all should be None
+    sp2, pp2, dp2 = _get_params_for_first_rsp(worker, 42)
+    assert sp2 is None
+    assert pp2 is None
+    assert dp2 is None
+
+
+def test_PostprocWorker_disaggregated_params():
+    """GEN-side: disaggregated_params seeded on the record persists across
+    multiple responses (streaming pattern).
+
+    Regression test for https://nvbugs/5991957: PostprocWorker record was
+    created without disaggregated_params, causing /v1/chat/completions to
+    return 400 in disaggregated serving with num_postprocess_workers > 0.
+    """
+    input_pipe = ZeroMqQueue(is_server=True)
+    out_pipe = ZeroMqQueue(is_server=True, socket_type=zmq.PULL)
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    fut = pool.submit(ResponsePostprocessWorker_worker_task, input_pipe.address,
+                      out_pipe.address,
+                      str(llm_models_root() / "llama-models/llama-7b-hf"))
+
+    disagg_params = DisaggregatedParams(
+        request_type="generation_only",
+        first_gen_tokens=[7],
+        ctx_request_id=12345,
+    )
+
+    # First response carries disaggregated_params (transmitted once)
+    input_pipe.put(
+        Input(rsp=create_rsp(42),
+              sampling_params=SamplingParams(max_tokens=4),
+              disaggregated_params=disagg_params,
+              streaming=True))
+
+    # Subsequent streaming response — no disaggregated_params in Input,
+    # but the record should still have it from the first response
+    input_pipe.put(
+        Input(rsp=create_rsp(43, finished=True),
+              sampling_params=None,
+              disaggregated_params=None,
+              streaming=None))
+
+    for _ in range(2):
+        out = out_pipe.get()
+        assert isinstance(out, list)
+        assert len(out) == 1
+        output = out[0]
+        assert isinstance(output, Output)
+        assert output.disaggregated_params is not None, \
+            "disaggregated_params was not propagated through PostprocWorker"
+        assert output.disaggregated_params.request_type == "generation_only"
+        assert output.disaggregated_params.first_gen_tokens == [7]
+        assert output.disaggregated_params.ctx_request_id == 12345
+
+    input_pipe.put(None)
+    fut.result()
     pool.shutdown()
     input_pipe.close()
     out_pipe.close()

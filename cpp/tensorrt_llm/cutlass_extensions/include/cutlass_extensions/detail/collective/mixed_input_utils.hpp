@@ -27,6 +27,78 @@
 namespace cutlass::gemm::collective::detail
 {
 
+using namespace cute;
+
+typedef uint32_t __nv_fp4x8_storage_t;
+typedef uint32_t __nv_bf16x2_storage_t;
+typedef cutlass::uint128_t __nv_bf16x8_storage_t;
+
+constexpr int int4_group_size = 128;
+constexpr int mxfp4_group_size = 32;
+
+inline __device__ unsigned prmt(unsigned hi, unsigned lo, unsigned select_code)
+{
+    unsigned res = 0;
+
+    asm volatile(
+        "{\n"
+        "prmt.b32 %0, %1, %2, %3;\n"
+        "}\n"
+        : "=r"(res)
+        : "r"(lo), "r"(hi), "r"(select_code));
+
+    return res;
+}
+
+__device__ __inline__ __nv_fp8x4_storage_t cvt_lut_bf16(unsigned const index)
+{
+    const __nv_fp8x4_storage_t h4b_lut = 0x03020100U; // 7654
+    const __nv_fp8x4_storage_t l4b_lut = 0xFFFEFC00U; // 3210
+
+    __nv_fp8x4_storage_t lut_res = prmt(h4b_lut, l4b_lut, index);
+
+    return lut_res;
+}
+
+__device__ __inline__ __nv_bf16x8_storage_t psx_cvt_lut_prmt_fp4x8_to_bf16x8(const __nv_fp4x8_storage_t fp4x8)
+{
+    __nv_bf16x8_storage_t bf16x8_raw = {0, 0};
+    __nv_bf16x2_storage_t* bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t*>(&bf16x8_raw);
+
+    unsigned zero_padding = 0x00000000U;
+
+    unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+    unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+
+    __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4);  // 7654
+    __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4);  // 3210
+
+    bf16x2_raw[0] = prmt(zero_padding, l4b_2to9_bits, 0x1707U) >> 2U; // 1 0
+    bf16x2_raw[1] = prmt(zero_padding, l4b_2to9_bits, 0x3727U) >> 2U; // 3 2
+    bf16x2_raw[2] = prmt(h4b_2to9_bits, zero_padding, 0x5040U) >> 2U; // 5 4
+    bf16x2_raw[3] = prmt(h4b_2to9_bits, zero_padding, 0x7060U) >> 2U; // 7 6
+
+    __nv_bf16x2_storage_t bf16x2_0to1_bits;
+
+    __nv_fp8x4_storage_t h_fp8x2_0to1_bits = (fp4x8 & 0x0000C0C0U);         // 3 1
+    __nv_fp8x4_storage_t l_fp8x2_0to1_bits = (fp4x8 & 0x00000C0CU) << 4U;   // 2 0
+
+    bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x4707U); // 1 0
+    bf16x2_raw[0] = bf16x2_raw[0] | bf16x2_0to1_bits;
+    bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x5717U); // 3 2
+    bf16x2_raw[1] = bf16x2_raw[1] | bf16x2_0to1_bits;
+
+    h_fp8x2_0to1_bits = (fp4x8 & 0xC0C00000U);                              // 7 5
+    l_fp8x2_0to1_bits = (fp4x8 & 0x0C0C0000U) << 4U;                        // 6 4
+
+    bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x6020U); // 5 4
+    bf16x2_raw[2] = bf16x2_raw[2] | bf16x2_0to1_bits;
+    bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x7030U); // 7 6
+    bf16x2_raw[3] = bf16x2_raw[3] | bf16x2_0to1_bits;
+
+    return bf16x8_raw;
+}
+
 template <class Collective>
 struct MixedGroupedGemmInputUtils
 {
@@ -46,6 +118,7 @@ private:
     static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
     static constexpr auto ModeHasScales = Collective::ModeHasScales;
     static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
+    static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
 
 public:
     static constexpr auto elements_per_smem_scale()
@@ -239,6 +312,27 @@ public:
         }
     }
 
+    // The core converter uses a lookup table to converts i4 -> 8 bit value.
+    template <class EngineIn, class LayoutIn, class EngineOut,
+        class LayoutOut>
+    CUTLASS_DEVICE static void fp4tobf16_lookup_table_convert( // Accept mutable temporaries
+        Tensor<EngineIn, LayoutIn> const& src, Tensor<EngineOut, LayoutOut>&& dst)
+    {
+        fp4tobf16_lookup_table_convert(src, dst);
+    }
+
+    template <class EngineIn, class LayoutIn, class EngineOut, class LayoutOut>
+    CUTLASS_DEVICE static void fp4tobf16_lookup_table_convert(
+        Tensor<EngineIn, LayoutIn> const& src, Tensor<EngineOut, LayoutOut>& dst)
+    {
+
+        // View the input as reg
+        auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
+        auto&& dst_ = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
+
+        dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8(src_);
+    }
+
     /// Utilities to dequantize A.
     template <class Layout>
     CUTLASS_DEVICE static void static_check_scale(Layout const& tensor)
@@ -253,7 +347,6 @@ public:
         static_check_scale(flatten(Layout{}));
     }
 
-    // dequantize_A_kblock is here!!!
     template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut, class... Ts>
     CUTLASS_DEVICE static void dequantize_A_kblock(Tensor<EngineIn, LayoutIn> const& tCrA_load,
         Tensor<EngineOut, LayoutOut>& tCrA_mma, cute::tuple<Ts...>& partitioned_extra_info, int const k_block)
@@ -288,8 +381,6 @@ public:
         }
         else if constexpr (UseScaleLookupTable)
         {
-            // this path
-
             constexpr int num_elements = decltype(size(src))::value;
             static_assert(is_same_v<RealSwappedElementA, cutlass::int4b_t>,
                 "Lookup table only supports int4 being the quant type now.");
@@ -424,7 +515,6 @@ public:
         static_assert(size_v<LayoutIn> == cosize_v<LayoutIn>);
         static_assert(size_v<LayoutOut> == cosize_v<LayoutOut>);
         using SrcType = typename EngineIn::value_type;
-        using DstType = typename EngineOut::value_type;
 
         Tensor src = tCrA_load(_, _, k_block);
         Tensor dst = tCrA_mma(_, _, k_block);
@@ -441,7 +531,14 @@ public:
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size<1>(dst_vm); ++i)
         {
-            LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+            if constexpr (UseFP4ToBF16LookupTable)
+            {
+                fp4tobf16_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
+            }
+            else
+            {
+                LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+            }
         }
     }
 
@@ -589,4 +686,212 @@ public:
     }
 };
 
+template <class Collective>
+struct MixedInputUtilsSM100
+{
+private:
+    using KernelSchedule = typename Collective::KernelSchedule;
+    using ConversionMode = typename Collective::ConversionMode;
+    using SmemLayoutA = typename Collective::SmemLayoutA;
+    using SmemLayoutB = typename Collective::SmemLayoutB;
+    using ElementScale = typename Collective::ElementScale;
+    using ElementZero = typename Collective::ElementZero;
+    static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
+
+public:
+    // Helper functions to select packing for conversion
+    template <class SrcType, class DstType, int Cosize>
+    struct select_packing
+    { // Naive packing policy
+
+        static constexpr auto value()
+        {
+            return Int<cute::gcd(Cosize, 32 / cute::min(sizeof_bits_v<SrcType>, sizeof_bits_v<DstType>))>{};
+        }
+    };
+
+    /// (Designed for separate transform pipeline in Blackwell)
+    /// Utilities to dequantize A.
+    template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut, class... Ts>
+    CUTLASS_DEVICE static void dequantize_A_kblock_for_transform(Tensor<EngineIn, LayoutIn> const& tArA,
+        Tensor<EngineOut, LayoutOut>& tArACompute, cute::tuple<Ts...> const& partitioned_extra_info, int const k_block)
+    {
+
+        static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
+        static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
+        static_assert(cosize_v<LayoutIn> == cosize_v<LayoutOut>);
+        static_assert(size_v<LayoutIn> == cosize_v<LayoutIn>);
+        static_assert(size_v<LayoutOut> == cosize_v<LayoutOut>);
+        using SrcType = typename EngineIn::value_type;
+        using DstType = typename EngineOut::value_type;
+
+        auto src = tArA(_, _, _, k_block);
+        auto dst = tArACompute(_, _, _, k_block);
+        auto pSrc = raw_pointer_cast(src.data());
+        auto pDst = const_cast<DstType*>(raw_pointer_cast(dst.data()));
+        constexpr int num_elements = decltype(size(src))::value;
+
+        constexpr int pack = decltype(select_packing<SrcType, DstType, num_elements>::value())::value;
+        using Converter
+            = cutlass::NumericArrayConverter<DstType, SrcType, pack, cutlass::FloatRoundStyle::round_to_nearest>;
+        using SrcArray = cutlass::Array<SrcType, pack>;
+        using DstArray = cutlass::Array<DstType, pack>;
+        constexpr int DstElementsPerReg = 32 / sizeof_bits_v<DstType>;
+        using RegArray = cutlass::AlignedArray<uint32_t, pack / DstElementsPerReg, sizeof(DstArray)>;
+
+        auto src_arr = recast<SrcArray>(src);
+        auto dst_arr = recast<DstArray>(dst);
+
+        Tensor dst_vm = cute::group_modes<1, -1>(cute::zipped_divide(dst, pack));
+
+        if constexpr (KernelConversionMode == ConversionMode::DirectConvert)
+        {
+            cute::transform(src_arr, dst_arr, Converter::convert);
+        }
+        else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale)
+        {
+
+            auto const& scales = cute::get<1>(partitioned_extra_info)(_, _, _, k_block);
+
+            CUTE_STATIC_ASSERT_V(size(src) == size(scales));
+
+            if constexpr (is_same_v<DstType, ElementScale>)
+            {
+                cute::transform(src_arr, dst_arr, Converter::convert);
+
+                using ScaleArray = cutlass::Array<ElementScale, pack>;
+                auto scale_arr = recast<ScaleArray>(filter_zeros(scales));
+
+                if constexpr (is_same_v<DstType, cutlass::bfloat16_t>)
+                {
+                    Tensor scales_vm = cute::group_modes<1, -1>(cute::zipped_divide(scales, pack));
+
+                    for (int i = 0; i < size<1>(dst_vm); ++i)
+                    {
+                        auto&& r = cute::recast<RegArray>(dst_vm(_, i))(0);
+                        auto&& scale_reg = cute::recast<RegArray>(scales_vm(_, i))(0);
+                        CUTLASS_PRAGMA_UNROLL
+                        for (size_t ii = 0; ii < RegArray::kElements; ++ii)
+                        {
+                            __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
+                            bf16x2_val = __hmul2(bf16x2_val, reinterpret_cast<__nv_bfloat162 const&>(scale_reg[ii]));
+                        }
+                    }
+                }
+                else
+                {
+                    cute::transform(dst_arr, scale_arr, dst_arr, cute::multiplies{});
+                }
+            }
+            else
+            {
+                constexpr int pack1 = decltype(select_packing<SrcType, ElementScale, num_elements>::value())::value;
+                constexpr int pack2 = decltype(select_packing<ElementScale, DstType, num_elements>::value())::value;
+                constexpr int pack = cute::gcd(pack1, pack2);
+                using Converter1 = cutlass::NumericArrayConverter<ElementScale, SrcType, pack,
+                    cutlass::FloatRoundStyle::round_to_nearest>;
+                using Converter2 = cutlass::NumericArrayConverter<DstType, ElementScale, pack,
+                    cutlass::FloatRoundStyle::round_to_nearest>;
+                using SrcArray = cutlass::Array<SrcType, pack>;
+                using DstArray = cutlass::Array<DstType, pack>;
+                using StageArray = cutlass::Array<ElementScale, pack>;
+                constexpr int iters = num_elements / pack;
+
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < iters; ++i)
+                {
+                    SrcArray const* pSrcArr = reinterpret_cast<SrcArray const*>(pSrc) + i;
+                    DstArray* pDstArr = reinterpret_cast<DstArray*>(pDst) + i;
+                    StageArray stageArr;
+                    stageArr = Converter1::convert(*pSrcArr);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int j = 0; j < pack; ++j)
+                    {
+                        stageArr[j] = stageArr[j] * scales[i * pack + j];
+                    }
+                    *pDstArr = Converter2::convert(stageArr);
+                }
+            }
+        }
+        else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero)
+        {
+            static_assert(is_same_v<ElementScale, ElementZero>, "ElementScale and ElementZero must be the same.");
+
+            auto const& scales = cute::get<1>(partitioned_extra_info)(_, _, _, k_block);
+            auto const& zeros = cute::get<3>(partitioned_extra_info)(_, _, _, k_block);
+            CUTE_STATIC_ASSERT_V(size(src) == size(scales));
+            CUTE_STATIC_ASSERT_V(size(src) == size(zeros));
+
+            if constexpr (is_same_v<DstType, ElementZero>)
+            {
+                cute::transform(src_arr, dst_arr, Converter::convert);
+
+                using ScaleArray = cutlass::Array<ElementScale, pack>;
+                auto scale_arr = recast<ScaleArray>(filter_zeros(scales));
+
+                using ZeroArray = cutlass::Array<ElementZero, pack>;
+                auto zero_arr = recast<ZeroArray>(filter_zeros(zeros));
+
+                if constexpr (is_same_v<DstType, cutlass::bfloat16_t>)
+                {
+                    Tensor scales_vm = cute::group_modes<1, -1>(cute::zipped_divide(scales, pack));
+                    Tensor zeros_vm = cute::group_modes<1, -1>(cute::zipped_divide(zeros, pack));
+
+                    for (int i = 0; i < size<1>(dst_vm); ++i)
+                    {
+                        auto&& r = cute::recast<RegArray>(dst_vm(_, i))(0);
+                        auto&& scale_reg = cute::recast<RegArray>(scales_vm(_, i))(0);
+                        auto&& zero_reg = cute::recast<RegArray>(zeros_vm(_, i))(0);
+                        CUTLASS_PRAGMA_UNROLL
+                        for (size_t ii = 0; ii < RegArray::kElements; ++ii)
+                        {
+                            __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
+                            bf16x2_val = __hmul2(bf16x2_val, reinterpret_cast<__nv_bfloat162 const&>(scale_reg[ii]));
+                            bf16x2_val = __hadd2(bf16x2_val, reinterpret_cast<__nv_bfloat162 const&>(zero_reg[ii]));
+                        }
+                    }
+                }
+                else
+                {
+                    cute::transform(dst_arr, scale_arr, dst_arr, cute::multiplies{});
+                    cute::transform(dst_arr, zero_arr, dst_arr, cute::plus{});
+                }
+            }
+            else
+            {
+                constexpr int pack1 = decltype(select_packing<SrcType, ElementScale, num_elements>::value())::value;
+                constexpr int pack2 = decltype(select_packing<ElementScale, DstType, num_elements>::value())::value;
+                constexpr int pack = cute::gcd(pack1, pack2);
+                using Converter1 = cutlass::NumericArrayConverter<ElementScale, SrcType, pack,
+                    cutlass::FloatRoundStyle::round_to_nearest>;
+                using Converter2 = cutlass::NumericArrayConverter<DstType, ElementScale, pack,
+                    cutlass::FloatRoundStyle::round_to_nearest>;
+                using SrcArray = cutlass::Array<SrcType, pack>;
+                using DstArray = cutlass::Array<DstType, pack>;
+                using StageArray = cutlass::Array<ElementScale, pack>;
+                constexpr int iters = num_elements / pack;
+
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < iters; ++i)
+                {
+                    SrcArray const* pSrcArr = reinterpret_cast<SrcArray const*>(pSrc) + i;
+                    DstArray* pDstArr = reinterpret_cast<DstArray*>(pDst) + i;
+                    StageArray stageArr;
+                    stageArr = Converter1::convert(*pSrcArr);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int j = 0; j < pack; ++j)
+                    {
+                        stageArr[j] = stageArr[j] * scales[i * pack + j] + zeros[i * pack + j];
+                    }
+                    *pDstArr = Converter2::convert(stageArr);
+                }
+            }
+        }
+        else
+        {
+            static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                "Conversion mode not handled for input partitioning.");
+        }
+    }
+};
 } // namespace cutlass::gemm::collective::detail
