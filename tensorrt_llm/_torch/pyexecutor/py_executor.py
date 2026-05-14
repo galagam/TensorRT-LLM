@@ -1052,6 +1052,14 @@ class PyExecutor:
                                 and self.ctx_in_transmission_requests):
                             self._terminate_ctx_finished_requests()
 
+                    while not result_queue.empty():
+                        self._handle_overlap_forward_result(
+                            result_queue.get_nowait())
+                        inflight_batches -= 1
+                        if (self.kv_cache_transceiver
+                                and self.ctx_in_transmission_requests):
+                            self._terminate_ctx_finished_requests()
+
                     profile_step()
                     if self.enable_iter_perf_stats:
                         iter_start_time = time.time()
